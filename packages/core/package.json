@@ -1,0 +1,59 @@
+{
+  "name": "@evillite/core",
+  "version": "0.1.1",
+  "description": "EvilLite Client Core",
+  "keywords": [
+    "highlite",
+    "ryelite",
+    "plugin",
+    "typescript",
+    "types",
+    "definitions",
+    "framework"
+  ],
+  "homepage": "https://github.com/ash-of-the-meadow/rl-core#readme",
+  "bugs": {
+    "url": "https://github.com/ash-of-the-meadow/rl-core/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ash-of-the-meadow/rl-core.git"
+  },
+  "license": "GPL-3.0-only",
+  "author": "ryelite",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "directories": {
+    "doc": "docs"
+  },
+  "files": [
+    "dist/**/*.d.ts",
+    "dist/**/*.js",
+    "dist/**/*.js.map",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node esbuild.mjs && tsc --emitDeclarationOnly",
+    "prepublishOnly": "yarn run build"
+  },
+  "dependencies": {
+    "acorn": "^8.15.0",
+    "acorn-walk": "^8.3.4",
+    "idb": "^8.0.3",
+    "on-change": "^5.0.1",
+    "tsc": "^2.0.4"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.8",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "packageManager": "yarn@4.9.2"
+}

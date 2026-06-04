@@ -1,0 +1,79 @@
+<html>
+
+<head>
+    <title>Settings</title>
+    <script type="module" src="settings/settings.ts"></script>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="/css/index.css" />
+    <link rel="stylesheet" href="/css/settings.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&display=swap"
+        rel="stylesheet">
+    <style>
+        .highlite_titlebar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            width: 100%;
+        }
+
+        #window-controls {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-left: 20px;
+            width: 65px;
+            margin-right: 10px;
+        }
+
+        #window-controls .window-control .iconify {
+            font-size: 14px;
+            margin: 0 5px;
+            color: var(--theme-text-primary, #ffffff);
+            transition: color 0.2s ease;
+        }
+
+        #window-controls .window-control:hover .iconify {
+            color: var(--theme-accent, #f9f449);
+        }
+    </style>
+</head>
+
+<body>
+    <div class="highlite_titlebar">
+        <div id="darwin-spacer"></div>
+        <div style="display: flex; margin-left: 5px; align-items: center">
+            <img id="logoImg" src="/icons/icon.png" alt="HighLite Logo" />
+            <span id="logoText">RyeLite Settings</span>
+        </div>
+
+        <!-- Add Traditional Window Controls-->
+        <div id="window-controls">
+            <a id="minimizeBtn" class="window-control" title="Minimize"><i class="iconify"
+                    data-icon="material-symbols:minimize"></i></a>
+            <a id="maximizeBtn" class="window-control" title="Maximize"><i class="iconify"
+                    data-icon="material-symbols:crop-square-outline"></i></a>
+            <a id="closeBtn" class="window-control" title="Close"><i class="iconify"
+                    data-icon="material-symbols:close"></i></a>
+        </div>
+    </div>
+
+
+
+    <div id="settings-content"></div>
+
+    <!-- Restart required modal -->
+    <div id="restart-modal" class="modal-overlay" aria-hidden="true">
+        <div class="modal">
+            <h3 class="modal-title">Restart required</h3>
+            <p class="modal-message">A restart will be required for changes to take effect.</p>
+            <div class="modal-actions">
+                <button id="restart-ok" class="btn btn-apply" type="button">Okay</button>
+            </div>
+        </div>
+    </div>
+</body>
+
+</html>

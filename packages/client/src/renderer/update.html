@@ -1,0 +1,92 @@
+<!-- Copyright (C) 2025  HighLite
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>. -->
+
+<!doctype html>
+<!-- Revamped Update Page with modern layout, progress bar, and styled release notes -->
+
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="/css/updater.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&display=swap"
+        rel="stylesheet">
+    <title>RyeLite Updater</title>
+</head>
+
+<body>
+        <div class="highlite_titlebar">
+            <div id="darwin-spacer"></div>
+            <div style="display: flex; align-items: center">
+                <img id="logoImg" src="/icons/icon.png" alt="HighLite Logo" />
+                <span id="logoText">RyeLite</span>
+            </div>
+
+            <div id="iconbar" style="display: flex; height: -webkit-fill-available; align-items: anchor-center;">
+                <div id="window-controls">
+                    <a id="closeBtn" class="window-control" title="Close">
+                        <i class="iconify" data-icon="material-symbols:close"></i>
+                    </a>
+                </div>
+            </div>
+        </div>
+
+    <main id="update-container" class="container">
+        <header class="hero">
+            <div class="brand">
+                <img src="/icons/icon@2x.png" alt="HighLite" class="brand-logo" />
+                <div class="brand-text">
+                    <h1>Updating RyeLite</h1>
+                    <p id="update-status" class="status">Checking for updates…</p>
+                </div>
+                <div id="update-buttons" class="actions">
+                    <span id="progressLoader" class="spinner" aria-hidden="true"></span>
+                    <button id="updateNow" class="btn btn-primary" style="display: none">Update Now</button>
+                    <button id="updateLater" class="btn btn-ghost" style="display: none">Update Later</button>
+                    <button id="restartNow" class="btn btn-success" style="display: none">Restart Now</button>
+                    <button id="restartLater" class="btn btn-ghost" style="display: none">Restart Later</button>
+                </div>
+            </div>
+        </header>
+
+        <section class="progress-section">
+            <div class="progress-visual">
+                <div class="progress" aria-label="Download progress" role="progressbar" aria-valuemin="0"
+                    aria-valuemax="100" aria-valuenow="0">
+                    <div id="progressLabel" class="progress-label" aria-hidden="true">0%</div>
+                    <div id="progressBar" class="progress-bar" style="width: 0%"></div>
+                </div>
+            </div>
+        </section>
+
+        <section id="update-change" class="release-notes">
+            <div class="card">
+                <div class="card-header">
+                    <h2 id="releaseName" class="card-title">Release Notes</h2>
+                </div>
+                <div id="releaseNotes" class="card-body"></div>
+            </div>
+        </section>
+    </main>
+
+    <script type="module" src="updater/updater.ts"></script>
+</body>
+
+</html>

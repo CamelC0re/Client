@@ -1,0 +1,253 @@
+/*
+Copyright (C) 2025  HighLite
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later versio
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more detail
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
+:root {
+    --theme-background: #1a1a1a;
+    --theme-elevated: #1f1f1f;
+    --theme-surface: #222222;
+    --theme-border: rgba(255,255,255,0.1);
+    --theme-text: #ffffff;
+    --theme-muted: rgba(255,255,255,0.7);
+    --theme-accent: #F9F449;
+    --theme-success: #10b981;
+    --titlebar-height: 28px;
+}
+
+body {
+    margin: 0;
+    overflow: hidden;
+    background: var(--theme-background);
+    color: var(--theme-text);
+    font-family: 'Inter', sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+.highlite_titlebar {
+    height: var(--titlebar-height);
+    min-height: var(--titlebar-height);
+    max-height: var(--titlebar-height);
+    background: #141414;
+    width: 100%;
+    font-size: 14px;
+    color: white;
+    display: flex;
+    align-items: center;
+    font-family: 'Inter';
+    border-bottom: 1px solid #353535;
+    /* Electron allow user to drag the window */
+    -webkit-app-region: drag;
+    justify-content: space-between;
+    padding: 0 12px 0 5px;
+}
+
+.highlite_titlebar #logoText {
+    margin-left: 5px;
+}
+
+.highlite_titlebar #logoImg {
+    height: 25px;
+}
+
+.highlite_titlebar a {
+    cursor: pointer;
+    color: white;
+    text-decoration: none;
+}
+
+.highlite_titlebar a {
+    /* Allow clicking on the links */
+    -webkit-app-region: no-drag;
+}
+
+/* Layout */
+.container {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    padding: 16px;
+    height: calc(100vh - var(--titlebar-height));
+    box-sizing: border-box;
+}
+
+.hero .brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.brand-logo {
+    width: 40px;
+    height: 40px;
+    border-radius: 8px;
+}
+
+.brand-text h1 {
+    margin: 0;
+    font-size: 18px;
+}
+
+.brand-text .status {
+    margin: 4px 0 0 0;
+    color: var(--theme-muted);
+    font-size: 13px;
+}
+
+.progress-section {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.progress-visual {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.spinner {
+  width: 22px;
+  height: 22px;
+  border: 3px solid rgba(255,255,255,0.15);
+  border-top-color: var(--theme-accent);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.progress {
+    position: relative;
+    flex: 1;
+    height: 15px;
+    background: #2a2a2a;
+    border-radius: 999px;
+    overflow: hidden;
+    border: 1px solid var(--theme-border);
+}
+
+.progress-label {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    color: var(--theme-text);
+    mix-blend-mode: difference;
+    pointer-events: none;
+}
+
+.progress-bar {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--theme-accent), #fff176);
+    transition: width .2s ease;
+}
+
+.progress-text {
+    font-size: 13px;
+    color: var(--theme-muted);
+}
+
+/* Release notes card */
+.release-notes { display: none; }
+.release-notes .card {
+    background: var(--theme-surface);
+    border: 1px solid var(--theme-border);
+    border-radius: 12px;
+    overflow: hidden;
+}
+.release-notes .card-header {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--theme-border);
+    background: #1e1e1e;
+}
+.release-notes .card-title { margin: 0; font-size: 14px; }
+.release-notes .card-body {
+    padding: 12px;
+    max-height: 180px;
+    overflow: auto;
+}
+
+/* Actions */
+.actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    flex: auto;
+}
+
+#update-change a {
+    color: white;
+    text-decoration: underline;
+}
+/* Backward-compat visibility defaults for updater.ts logic */
+#progressText { display: none; }
+#progressLoader { visibility: visible; }
+
+/*
+Button CSS
+*/
+button {
+    background-color: transparent;
+    color: var(--theme-text);
+    border: 1px solid var(--theme-border);
+    padding: 8px 14px;
+    font-size: 14px;
+    cursor: pointer;
+    border-radius: 8px;
+    transition: background .2s ease, border-color .2s ease, transform .02s ease;
+}
+button:hover { background-color: #2a2a2a; border-color: rgba(255,255,255,0.2); }
+button:active { transform: translateY(1px); }
+button:disabled { opacity: .6; cursor: not-allowed; }
+
+.btn-primary { background: var(--theme-accent); color: #1a1a1a; border-color: transparent; }
+.btn-primary:hover { background: #fff176; }
+
+.btn-success { background: var(--theme-success); color: white; border-color: transparent; }
+.btn-success:hover { background: #0ea371; }
+
+.btn-ghost { background: transparent; color: var(--theme-text); border-color: var(--theme-border); }
+.btn-ghost:hover { background: #2a2a2a; }
+
+/* Links inside notes */
+#update-change a { color: white; text-decoration: underline; }
+
+#iconbar .iconify {
+    margin: 0 5px;
+    font-size: 16px;
+    color: var(--theme-text-primary, #ffffff);
+    transition: color 0.2s ease;
+}
+
+#iconbar a:hover .iconify {
+    color: var(--theme-accent, #f9f449);
+}
+
+#iconbar #window-controls {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: fit-content;
+    margin-right: 5px;
+}
+
+#window-controls .window-control .iconify {
+    font-size: 14px;
+}

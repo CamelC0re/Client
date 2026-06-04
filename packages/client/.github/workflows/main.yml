@@ -1,0 +1,178 @@
+name: Build/release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*.*.*'
+    branches:
+      - staging
+
+permissions:
+  contents: write
+
+jobs:
+  get_version:
+    runs-on: ubuntu-latest
+    outputs:
+      full_version: ${{ steps.version.outputs.full_version }}
+      tag_name: ${{ steps.version.outputs.tag_name }}
+      release_name: ${{ steps.version.outputs.release_name }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      draft: ${{ steps.version.outputs.draft }}
+      base_version: ${{ steps.version.outputs.base_version }}
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Get version and determine release properties
+        id: version
+        run: |
+          BASE_VERSION=$(node -p "require('./package.json').version")
+          
+          # Manual staging run
+          if [[ "${{ github.event_name }}" == 'workflow_dispatch' && "${{ github.ref_name }}" == 'staging' ]]; then
+            DRAFT="false"
+            PRERELEASE="true"
+            TAG_NAME="v${BASE_VERSION}-beta.${{ github.run_id }}"
+            RELEASE_NAME="Staging Build ${TAG_NAME}"
+            FULL_VERSION="${BASE_VERSION}-beta.${{ github.run_id }}"
+
+          # Manual branch run
+          elif [[ "${{ github.event_name }}" == 'workflow_dispatch' && "${{ github.ref_name }}" != 'staging' && "${{ github.ref_name }}" != 'main' ]]; then
+            DRAFT="true"
+            PRERELEASE="false"
+            TAG_NAME="v${BASE_VERSION}-test.${{ github.run_id }}"
+            RELEASE_NAME="Test Build ${TAG_NAME}"
+            FULL_VERSION="${BASE_VERSION}-test.${{ github.run_id }}"
+
+          # Staging branch
+          elif [[ "${{ github.ref_name }}" == 'staging' ]]; then
+            DRAFT="false"
+            PRERELEASE="true"
+            TAG_NAME="v${BASE_VERSION}-beta.${{ github.run_number }}"
+            RELEASE_NAME="Staging Build ${TAG_NAME}"
+            FULL_VERSION="${BASE_VERSION}-beta.${{ github.run_number }}"
+          
+          # Tag push (proper release)
+          elif [[ "${{ github.ref_type }}" == 'tag' ]]; then
+            DRAFT="false"
+            PRERELEASE="false"
+            TAG_NAME="${{ github.ref_name }}"
+            RELEASE_NAME="Release ${{ github.ref_name }}"
+            FULL_VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
+          fi
+
+          echo "full_version=${FULL_VERSION}" >> $GITHUB_OUTPUT
+          echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
+          echo "release_name=${RELEASE_NAME}" >> $GITHUB_OUTPUT
+          echo "prerelease=${PRERELEASE}" >> $GITHUB_OUTPUT
+          echo "draft=${DRAFT}" >> $GITHUB_OUTPUT
+
+  build:
+    needs: get_version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Install Node.js, NPM and Yarn
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/jod
+      
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Set Package Version
+        run: npm pkg set version=${{ needs.get_version.outputs.full_version }}
+      
+      - name: Install Package Dependencies
+        run: yarn install --frozen-lockfile
+      
+      - name: Build
+        run: yarn run build
+      
+      - name: Package Application
+        run: yarn run release --publish never
+        if: ${{ !env.ACT }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        if: ${{ !env.ACT }}
+        with:
+          name: build-${{ matrix.os }}
+          path: |
+            dist/*.dmg
+            dist/*.AppImage
+            dist/*.exe
+            dist/*.yml
+            dist/*.blockmap
+
+  release:
+    needs: [build, get_version]
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag' || github.ref_name == 'staging' || github.event_name == 'workflow_dispatch'
+
+    steps:      
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        if: ${{ !env.ACT }}
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: List downloaded files (for debugging)
+        if: ${{ !env.ACT }}
+        run: ls -R dist
+
+      - name: Create GitHub Release
+        id: create_release
+        if: ${{ !env.ACT }}
+        uses: actions/create-release@v1
+        with:
+          tag_name: ${{ needs.get_version.outputs.tag_name }}
+          release_name: ${{ needs.get_version.outputs.release_name }}
+          draft: ${{ needs.get_version.outputs.draft }}
+          prerelease: ${{ needs.get_version.outputs.prerelease }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload All Release Assets (CLI)
+        if: ${{ !env.ACT }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ needs.get_version.outputs.tag_name }} \
+            ./dist/**/*.dmg \
+            ./dist/**/*.AppImage \
+            ./dist/**/*Setup*.exe \
+            ./dist/**/latest*.yml \
+            ./dist/**/*.blockmap
+
+      - name: Output Expected Filenames for ACT
+        if: ${{ env.ACT }}
+        run: |
+          echo "--- ACT Local Test Output ---"
+          echo "Version: ${{ needs.get_version.outputs.full_version }}"
+          echo "Calculated Tag Name: ${{ needs.get_version.outputs.tag_name }}"
+          echo "Calculated Release Name: ${{ needs.get_version.outputs.release_name }}"
+          echo "Calculated Prerelease Status: ${{ needs.get_version.outputs.prerelease }}"
+          echo "--- Expected Asset Names ---"
+          echo "Windows: RyeLite-Setup-${{ needs.get_version.outputs.full_version }}.exe"
+          echo "macOS: RyeLite-${{ needs.get_version.outputs.full_version }}.dmg"
+          echo "Linux: RyeLite-${{ needs.get_version.outputs.full_version }}.AppImage"
+          echo "--- NOTE: Actual file paths depend on local build output in 'dist/' ---"

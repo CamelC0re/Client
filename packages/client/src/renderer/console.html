@@ -1,0 +1,111 @@
+<!-- Copyright (C) 2025  HighLite
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>. -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="/css/index.css" />
+    <link rel="stylesheet" href="/css/console.css" />
+    <title>Console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&display=swap" rel="stylesheet">
+    <style>
+        .highlite_titlebar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            width: 100%;
+        }
+
+        #window-controls {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-left: 20px;
+            width: 65px;
+            margin-right: 10px;
+        }
+
+        #window-controls .window-control .iconify {
+            font-size: 14px;
+            margin: 0 5px;
+            color: var(--theme-text-primary, #ffffff);
+            transition: color 0.2s ease;
+        }
+
+        #window-controls .window-control:hover .iconify {
+            color: var(--theme-accent, #f9f449);
+        }
+    </style>
+</head>
+<body style="background: var(--theme-background);">
+    <div class="highlite_titlebar">
+        <div id="darwin-spacer"></div>
+        <div style="display: flex; margin-left: 5px; align-items: center">
+            <img id="logoImg" src="/icons/icon.png" alt="HighLite Logo" />
+            <span id="logoText">RyeLite Console</span>
+        </div>
+        
+        <!-- Add Traditional Window Controls-->
+        <div id="window-controls">
+            <a id="minimizeBtn" class="window-control" title="Minimize"
+                ><i
+                    class="iconify"
+                    data-icon="material-symbols:minimize"
+                ></i
+            ></a>
+            <a id="maximizeBtn" class="window-control" title="Maximize"
+                ><i
+                    class="iconify"
+                    data-icon="material-symbols:crop-square-outline"
+                ></i
+            ></a>
+            <a id="closeBtn" class="window-control" title="Close"
+                ><i
+                    class="iconify"
+                    data-icon="material-symbols:close"
+                ></i
+            ></a>
+        </div>
+    </div>
+    
+    <div id="console">
+        <div class="console-controls">
+            <div class="filter-group">
+                <div class="filter-btn active" data-type="all">All</div>
+                <div class="filter-btn" data-type="error">Errors</div>
+                <div class="filter-btn" data-type="warning">Warnings</div>
+                <div class="filter-btn" data-type="info">Info</div>
+            </div>
+            <button class="clear-btn" id="clearConsole">Clear</button>
+        </div>
+
+        <div id="console-header">
+            <div class="header-timestamp">Timestamp</div>
+            <div class="header-message">Message</div>
+            <div class="header-source">Source</div>
+        </div>
+        
+        <div id="console-content">
+            <div class="console-empty" id="emptyState">
+                No console messages yet. Errors and warnings will appear here.
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="console/console.ts"></script>
+</body>
+</html>

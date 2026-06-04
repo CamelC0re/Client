@@ -1,0 +1,57 @@
+name: Build (Status Check)
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: Build (Status Check)
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js, NPM and Yarn
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Build application
+        run: yarn build
+
+      # Sanity check: make sure yarn start runs successfully
+      - name: Test yarn start (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          yarn start &
+          APP_PID=$!
+          sleep 10
+          kill $APP_PID || true
+      
+      - name: Test yarn start (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Start-Process -FilePath "yarn" -ArgumentList "start"
+          Start-Sleep -Seconds 10
+          Get-Process -Name "electron" -ErrorAction SilentlyContinue | Stop-Process -Force
+
+
+      # Dry run build (no upload, no publish)
+      - name: Dry run Electron build
+        run: yarn electron-builder --dir
+        env:
+          NODE_ENV: production

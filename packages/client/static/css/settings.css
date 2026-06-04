@@ -1,0 +1,299 @@
+/*
+Settings page styles, aligned with index.css and console.css theme tokens
+*/
+:root {
+    font-family: 'Inter', sans-serif;
+}
+
+#settings-content {
+  padding: 16px;
+  color: var(--theme-text-primary);
+  background: var(--theme-background);
+  height: calc(100vh - var(--titlebar-height));
+  overflow: auto;
+  box-sizing: border-box;
+}
+
+.settings-section {
+  margin: 16px auto;
+  max-width: 920px;
+}
+
+.settings-heading {
+  margin: 0 0 8px 0;
+  padding: 8px 4px;
+  color: var(--theme-text-secondary);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+
+.settings-card {
+  background: var(--theme-background-light);
+  border: 1px solid var(--theme-border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.setting-field {
+  display: flex;
+  gap: 16px;
+  padding: 14px 16px;
+  border-top: 1px solid var(--theme-border-light);
+}
+
+.setting-field:first-child {
+  border-top: none;
+}
+
+.setting-left {
+  flex: 1.6;
+  min-width: 260px;
+}
+
+.setting-right {
+  flex: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.setting-label {
+  display: block;
+  font-weight: 600;
+  color: var(--theme-text-primary);
+  margin-bottom: 4px;
+}
+
+.setting-description {
+  color: var(--theme-text-muted);
+  font-size: 12px;
+}
+
+.setting-input {
+  background: var(--theme-background-soft);
+  color: var(--theme-text-primary);
+  border: 1px solid var(--theme-border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-family: 'Inter', sans-serif;
+  font-size: 13px;
+}
+
+.setting-text,
+.setting-number,
+.setting-select {
+  width: clamp(220px, 60%, 520px);
+}
+
+.setting-input:focus {
+  outline: none;
+  border-color: var(--theme-accent);
+  box-shadow: 0 0 0 2px var(--theme-accent-transparent-20);
+}
+
+.setting-checkbox {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--theme-accent);
+}
+
+.setting-badge {
+  font-size: 11px;
+  border-radius: 999px;
+  padding: 4px 8px;
+  border: 1px solid var(--theme-border);
+  background: var(--theme-background-soft);
+  color: var(--theme-text-secondary);
+}
+
+.setting-badge.ok {
+  background: var(--theme-success-transparent-30);
+  border-color: var(--theme-success);
+  color: var(--theme-text-primary);
+}
+
+.setting-badge.bad {
+  background: var(--theme-danger-transparent-30);
+  border-color: var(--theme-danger);
+  color: var(--theme-text-primary);
+}
+
+.setting-badge::after {
+  content: '';
+}
+
+/* Buttons (lightweight, to match theme) */
+.btn {
+  -webkit-app-region: no-drag;
+  cursor: pointer;
+  user-select: none;
+  border-radius: 6px;
+  padding: 8px 12px;
+  border: 1px solid var(--theme-border);
+  background: var(--theme-background-soft);
+  color: var(--theme-text-primary);
+  font-family: 'Inter', sans-serif;
+  font-size: 13px;
+}
+
+.btn:hover {
+  background: var(--theme-background-light);
+  border-color: var(--theme-divider);
+}
+
+.btn:active {
+  background: var(--theme-background);
+}
+
+.btn-secondary {
+  background: var(--theme-accent-transparent-10);
+  border-color: var(--theme-border);
+  color: var(--theme-text-primary);
+}
+
+.btn-secondary:hover {
+  background: var(--theme-accent-transparent-20);
+  border-color: var(--theme-accent);
+}
+
+/* Sticky action bar */
+#settings-action-bar {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  display: flex;
+  gap: 8px;
+  background: var(--theme-background-light);
+  border: 1px solid var(--theme-border);
+  border-radius: 10px;
+  padding: 10px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.3);
+  opacity: 0;
+  transform: translateY(8px);
+  pointer-events: none;
+  transition: opacity .18s ease, transform .18s ease;
+  z-index: 1000;
+}
+
+#settings-action-bar.visible {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.btn-apply {
+  background: var(--theme-accent);
+  color: var(--theme-text-dark);
+  border-color: var(--theme-accent);
+  font-weight: 600;
+}
+.btn-apply:hover {
+  background: var(--theme-accent-light);
+  border-color: var(--theme-accent-light);
+}
+
+.btn-reset {
+  background: var(--theme-danger);
+  color: white;
+  border-color: var(--theme-danger);
+}
+.btn-reset:hover {
+  background: var(--theme-danger-dark);
+  border-color: var(--theme-danger-dark);
+}
+
+/* Prettier scrollbars for settings */
+#settings-content {
+  /* Firefox */
+  scrollbar-width: thin;
+  scrollbar-color: var(--theme-accent-muted) var(--theme-background-soft);
+  /* Keep layout from shifting when scrollbar appears */
+  scrollbar-gutter: stable;
+}
+
+/* Chromium / WebKit */
+#settings-content::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+#settings-content::-webkit-scrollbar-track {
+  background: var(--theme-background-soft);
+  border-left: 1px solid var(--theme-border-light);
+}
+
+#settings-content::-webkit-scrollbar-thumb {
+  background: linear-gradient(
+    180deg,
+    var(--theme-accent-transparent-40),
+    var(--theme-accent-transparent-20)
+  );
+  border-radius: 999px;
+  border: 2px solid var(--theme-background-soft);
+}
+
+#settings-content::-webkit-scrollbar-thumb:hover {
+  background: var(--theme-accent);
+}
+
+#settings-content::-webkit-scrollbar-thumb:active {
+  background: var(--theme-accent-dark);
+}
+
+#settings-content::-webkit-scrollbar-corner {
+  background: var(--theme-background-soft);
+}
+
+/* Hide scrollbar but keep scrolling */
+#settings-content {
+  /* Firefox */
+  scrollbar-width: none !important;
+  /* Old IE/Edge */
+  -ms-overflow-style: none;
+}
+
+#settings-content::-webkit-scrollbar {
+  width: 0 !important;
+  height: 0 !important;
+}
+
+/* Simple modal */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+}
+
+.modal-overlay.show {
+  display: flex;
+}
+
+.modal {
+  background: var(--theme-background-light);
+  border: 1px solid var(--theme-border);
+  border-radius: 10px;
+  padding: 16px;
+  min-width: 320px;
+  max-width: 520px;
+  box-shadow: 0 12px 32px rgba(0,0,0,.35);
+}
+
+.modal-title {
+  margin: 0 0 8px 0;
+  color: var(--theme-text-primary);
+}
+
+.modal-message {
+  margin: 0 0 16px 0;
+  color: var(--theme-text-secondary);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+}
