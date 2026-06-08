@@ -20,6 +20,11 @@ export default defineConfig(({ mode }) => {
       },
       ...(isDev && {
         server: {
+          hmr: {
+            protocol: 'ws',
+            host: 'localhost',
+            port: 5173
+          },
           fs: {
             allow: ['..']
           },

@@ -96,15 +96,13 @@ export class HookManager {
         const self = this;
         const targetClass = document.highlite.gameHooks[sourceClass];
         if (!targetClass) {
-            console.warn(`[EvilLite] Class ${sourceClass} not found in game hooks.`);
+            // console.warn(`[EvilLite] Class ${sourceClass} not found in game hooks.`);
             return false;
         }
 
         const classObject = targetClass.prototype;
         if (!classObject) {
-            console.warn(
-                `[EvilLite] Attempted to register unknown client class hook (${sourceClass}).`
-            );
+            // console.warn(`[EvilLite] Attempted to register unknown client class hook (${sourceClass}).`);
             return false;
         }
 
@@ -133,15 +131,13 @@ export class HookManager {
         const self = this;
         const targetClass = document.highlite.gameHooks[sourceClass];
         if (!targetClass) {
-            console.warn(`[EvilLite] Class ${sourceClass} not found in game hooks.`);
+            // console.warn(`[EvilLite] Class ${sourceClass} not found in game hooks.`);
             return false;
         }
 
         const classObject = targetClass.prototype;
         if (!classObject) {
-            console.warn(
-                `[EvilLite] Attempted to register unknown client class override hook (${sourceClass}).`
-            );
+            // console.warn(`[EvilLite] Attempted to register unknown client class override hook (${sourceClass}).`);
             return false;
         }
 
@@ -168,9 +164,7 @@ export class HookManager {
         const classObject = document.highlite.gameHooks[sourceClass];
 
         if (!classObject) {
-            console.warn(
-                `[EvilLite] Attempted to register unknown static client class hook (${sourceClass}).`
-            );
+            // console.warn(`[EvilLite] Attempted to register unknown static client class hook (${sourceClass}).`);
             return false;
         }
 
