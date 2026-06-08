@@ -121,6 +121,17 @@ export class settingsSchema extends SettingsSchema {
                 } as Field
             ]
         },
+        Login: {
+            heading: "Login",
+            fields: [
+                {
+                    label: "Clear reCAPTCHA session each launch",
+                    type: SettingTypes.BOOLEAN,
+                    description: "ON: wipe Google's reCAPTCHA cookies/cache on every launch (a fresh, cold session — useful if a session got flagged). OFF (recommended): keep the cookie so reCAPTCHA builds trust across logins and scores you higher over time.",
+                    default: false
+                } as Field
+            ]
+        },
         Screenshots: {
             heading: "Screenshots",
             fields: [

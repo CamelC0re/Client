@@ -21,7 +21,6 @@ import '@static/css/index.css';
 import '@static/css/overrides.css';
 import '@static/css/item-tooltip.css';
 
-import './helpers/recaptchaWarmup';
 import './helpers/titlebarHelpers.js';
 import { setupWorldSelectorObserver } from './helpers/worldSelectHelper';
 

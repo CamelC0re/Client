@@ -44,6 +44,22 @@ webFrame.executeJavaScript(`
     def(navigator, 'appVersion', function () { return winUa.replace('Mozilla/', ''); });
     def(navigator, 'platform', function () { return 'Win32'; });
     def(navigator, 'vendor', function () { return 'Google Inc.'; });
+    // Match the US-English locale our Windows identity implies (consistency, not a spoof).
+    def(navigator, 'languages', function () { return ['en-US', 'en']; });
+    def(navigator, 'language', function () { return 'en-US'; });
+
+    // 1b. Notification/permissions consistency. The classic headless tell is
+    //     Notification.permission === 'default' while permissions.query(notifications)
+    //     resolves to 'denied'. Real Chrome returns 'prompt'. Keep them aligned.
+    try {
+        if (window.Notification && Notification.permission === 'default' && navigator.permissions && navigator.permissions.query) {
+            var origQuery = navigator.permissions.query.bind(navigator.permissions);
+            navigator.permissions.query = function (desc) {
+                if (desc && desc.name === 'notifications') return Promise.resolve({ state: 'prompt', name: 'notifications', onchange: null });
+                return origQuery(desc);
+            };
+        }
+    } catch (e) {}
 
     // 2. Client Hints — Windows, with the Google Chrome brand (Electron omits it).
     var brands = [

@@ -50,6 +50,7 @@ function localMimeType(filePath: string): string {
 
 import './modules/userPasswordManagement';
 import './modules/windowEventManagement';
+import { settingsService } from '../../modules/settingsManagement';
 
 app.commandLine.appendSwitch('disable-background-timer-throttling');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
@@ -301,6 +302,9 @@ ipcMain.handle('reset-captcha-session', async () => {
     return true;
 });
 
+// Reliable renderer→main diagnostic channel (renderer console.* doesn't always reach the log).
+ipcMain.on('eq-diag', (_e, msg: string) => console.log('[EQ-DIAG]', msg));
+
 export async function createClientWindow() {
     // If RECAPTCHA_PROXY is set (e.g. "socks5://user:pass@host:1080"), route
     // all traffic through it so reCAPTCHA sees a residential IP.
@@ -310,22 +314,28 @@ export async function createClientWindow() {
         await session.defaultSession.setProxy({ proxyRules: proxyUrl }).catch(console.error);
     }
 
-    // Start every launch with a FRESH reCAPTCHA reputation. Repeated failed logins
-    // get Google to flag the session's _GRECAPTCHA cookie as abusive, and that bad
-    // score sticks to the cookie. Clearing Google's cookies + cache (NOT evilquest's
-    // session cookies) drops the burned reputation so the next attempt is judged clean.
-    try {
-        await session.defaultSession.clearCache();
-        for (const domain of ['google.com', 'www.google.com', 'gstatic.com', 'www.gstatic.com', 'recaptcha.net']) {
-            const cks = await session.defaultSession.cookies.get({ domain });
-            for (const c of cks) {
-                const host = c.domain?.replace(/^\./, '') ?? domain;
-                await session.defaultSession.cookies.remove(`https://${host}${c.path ?? '/'}`, c.name).catch(() => {});
+    // reCAPTCHA cookie handling is toggleable (Settings → Login).
+    //  ON  → wipe Google's cookies/cache each launch: a cold, fresh session. Good for
+    //        recovering from a flagged/burned session, but reCAPTCHA never builds trust.
+    //  OFF → keep the cookie so reCAPTCHA accumulates trust across logins (recommended).
+    // Either way we only touch Google's cookies, never evilquest's session.
+    const clearRecaptcha = settingsService.get('Login', 'Clear reCAPTCHA session each launch');
+    if (clearRecaptcha) {
+        try {
+            await session.defaultSession.clearCache();
+            for (const domain of ['google.com', 'www.google.com', 'gstatic.com', 'www.gstatic.com', 'recaptcha.net']) {
+                const cks = await session.defaultSession.cookies.get({ domain });
+                for (const c of cks) {
+                    const host = c.domain?.replace(/^\./, '') ?? domain;
+                    await session.defaultSession.cookies.remove(`https://${host}${c.path ?? '/'}`, c.name).catch(() => {});
+                }
             }
+            console.log('[ReCAPTCHA] cleared Google cookies + cache (Settings: clear-each-launch ON)');
+        } catch (e) {
+            console.error('[ReCAPTCHA] failed to clear Google session', e);
         }
-        console.log('[ReCAPTCHA] cleared Google cookies + cache for a fresh session');
-    } catch (e) {
-        console.error('[ReCAPTCHA] failed to clear Google session', e);
+    } else {
+        console.log('[ReCAPTCHA] keeping Google cookies so reCAPTCHA can build trust (Settings: clear-each-launch OFF)');
     }
 
     const mainWindow = new BrowserWindow({
