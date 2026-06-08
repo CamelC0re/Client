@@ -28,6 +28,23 @@ log.transports.file.level = 'debug';
 // Remove Electron's automation fingerprint so reCAPTCHA scores us as a real browser
 app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
 
+// Dev-only GPU enablement (EQ_GPU=1). On this dev box, launching through Xwayland
+// makes Chromium fall back to SwiftShader (software GL); native Wayland + the DRI
+// render node uses the real GPU (the recipe Google Chrome uses here). Shipped users
+// auto-detect their GPU, so this is gated to dev.
+if (process.env.EQ_GPU === '1') {
+    // Hardware GL via ANGLE/EGL on the DRI render node, while keeping the X11
+    // presentation path (Wayland ozone renders fine but does NOT present frames to
+    // the visible window here — a grey-screen quirk). This gives the real GPU + a
+    // window that actually paints.
+    app.commandLine.appendSwitch('ignore-gpu-blocklist');
+    app.commandLine.appendSwitch('enable-gpu-rasterization');
+    app.commandLine.appendSwitch('enable-zero-copy');
+    app.commandLine.appendSwitch('use-gl', 'angle');
+    app.commandLine.appendSwitch('use-angle', 'gl-egl');
+    app.commandLine.appendSwitch('disable-gpu-driver-bug-workarounds');
+}
+
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
     app.quit();
@@ -38,6 +55,18 @@ if (!gotTheLock) {
 let consoleWindowRef: BrowserWindow | null = null;
 
 app.whenReady().then(async () => {
+    // Report whether hardware GL is actually active (vs SwiftShader software fallback).
+    // Query AFTER the GPU process settles (the immediate value is unreliable).
+    setTimeout(async () => {
+        try {
+            const status = app.getGPUFeatureStatus();
+            console.log(`[GPU] webgl=${status.webgl} webgl2=${status.webgl2} gpu_compositing=${status.gpu_compositing}`);
+            const info: any = await app.getGPUInfo('complete');
+            const aux = info?.auxAttributes ?? info;
+            console.log(`[GPU] renderer=${aux?.glRenderer ?? '?'} | vendor=${aux?.glVendor ?? '?'} | driver=${aux?.driverVersion ?? '?'}`);
+        } catch (e) { console.log('[GPU] info unavailable', e); }
+    }, 6000);
+
     // Globally strip Electron and EvilLite from User-Agent so reCAPTCHA JS doesn't see it in navigator.userAgent
     app.userAgentFallback = app.userAgentFallback.replace(/Electron\/[0-9\.]+\s?/g, '').replace(/EvilLite\/[0-9\.]+\s?/g, '').trim();
     
