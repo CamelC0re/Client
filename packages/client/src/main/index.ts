@@ -25,6 +25,9 @@ log.initialize({ spyRendererConsole: true });
 log.transports.console.level = 'info';
 log.transports.file.level = 'debug';
 
+// Remove Electron's automation fingerprint so reCAPTCHA scores us as a real browser
+app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
+
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
     app.quit();
@@ -35,6 +38,9 @@ if (!gotTheLock) {
 let consoleWindowRef: BrowserWindow | null = null;
 
 app.whenReady().then(async () => {
+    // Globally strip Electron and EvilLite from User-Agent so reCAPTCHA JS doesn't see it in navigator.userAgent
+    app.userAgentFallback = app.userAgentFallback.replace(/Electron\/[0-9\.]+\s?/g, '').replace(/EvilLite\/[0-9\.]+\s?/g, '').trim();
+    
     electronApp.setAppUserModelId('com.ryelite.desktop');
     const updateWindow: BrowserWindow = await createUpdateWindow();
 

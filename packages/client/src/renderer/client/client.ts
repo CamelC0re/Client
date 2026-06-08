@@ -21,55 +21,15 @@ import '@static/css/index.css';
 import '@static/css/overrides.css';
 import '@static/css/item-tooltip.css';
 
+import './helpers/recaptchaWarmup';
 import './helpers/titlebarHelpers.js';
 import { setupWorldSelectorObserver } from './helpers/worldSelectHelper';
 
-// Fix Vite dynamic imports creating absolute absolute paths resolving to the local filesystem
-const originalCreateElement = document.createElement.bind(document);
-document.createElement = function(tagName: string) {
-    const el = originalCreateElement(tagName) as HTMLElement;
-    if (tagName.toLowerCase() === 'link') {
-        const originalSetAttribute = el.setAttribute.bind(el);
-        el.setAttribute = function(name: string, value: string) {
-            if (name === 'href' && value) {
-                if (value.startsWith('/assets/')) value = 'eq://evilquest.net' + value;
-            }
-            return originalSetAttribute(name, value);
-        };
-        Object.defineProperty(el, 'href', {
-            set: function(val) {
-                if (typeof val === 'string' && val.startsWith('/assets/')) val = 'eq://evilquest.net' + val;
-                originalSetAttribute('href', val);
-            },
-            get: function() { return el.getAttribute('href'); }
-        });
-    }
-    return el as any;
-};
+// Note: With the page running on https://evilquest.net, relative paths like
+// /assets/..., /data/..., /maps/..., /ui/..., /api/... resolve naturally to
+// https://evilquest.net/... which our protocol.handle('https') intercepts.
+// No fetch/XHR/createElement patching is needed for URL rewriting.
 
-// Patch fetch and XHR for Babylon.js asset loading
-const originalFetch = window.fetch;
-window.fetch = function(input, init) {
-    if (typeof input === 'string') {
-        if (input.startsWith('/assets/') || input.startsWith('/data/') || input.startsWith('/maps/') || input.startsWith('/ui/')) {
-            input = 'eq://evilquest.net' + input;
-        }
-    } else if (input instanceof URL) {
-        if (input.pathname.startsWith('/assets/') || input.pathname.startsWith('/data/') || input.pathname.startsWith('/maps/')) {
-            input = new URL('eq://evilquest.net' + input.pathname + input.search);
-        }
-    }
-    return originalFetch(input, init);
-};
-
-const originalXhrOpen = XMLHttpRequest.prototype.open;
-XMLHttpRequest.prototype.open = function(method: string, url: string | URL, ...args: any[]) {
-    let urlStr = url instanceof URL ? url.pathname + url.search : url;
-    if (urlStr.startsWith('/assets/') || urlStr.startsWith('/data/') || urlStr.startsWith('/maps/') || urlStr.startsWith('/ui/')) {
-        urlStr = 'eq://evilquest.net' + urlStr;
-    }
-    return (originalXhrOpen as any).call(this, method, urlStr, ...args);
-};
 
 // Sandbox dynamically injected game UI elements into the game wrapper
 const originalBodyAppendChild = document.body.appendChild.bind(document.body);
@@ -99,33 +59,59 @@ async function obtainGameClient() {
     // dynamically. We will need to set up interception for these scripts to apply Reflector hooks.
     console.log('[EvilLite] Preparing game client interception...');
     
-    // We will hook into the module loaded event injected by our eq:// protocol interceptor
-    (window as any).onEqModuleLoaded = () => {
+    // We will hook into the module loaded event injected by our https:// protocol interceptor
+    (window as any).onEqModuleLoaded = async () => {
+        console.log('[EvilLite] onEqModuleLoaded triggered!');
         if ((window as any).__eqSourceCode) {
-            if ((window as any).__eqTimeout) clearTimeout((window as any).__eqTimeout);
-            (window as any).__eqTimeout = setTimeout(async () => {
-                try {
-                    // Reflector parses the concatenated AST of all loaded modules
-                    await Reflector.loadHooksFromSource((window as any).__eqSourceCode);
-                    
-                    // If Core is already started, re-bind the newly discovered hooks
+            console.log('[EvilLite] Source code found, length:', (window as any).__eqSourceCode.length);
+            
+            // Prevent multiple executions
+            if ((window as any).__eqIsParsing) return;
+            (window as any).__eqIsParsing = true;
+
+            try {
+                console.log('[EvilLite] Starting Reflector parse...');
+                // Run Reflector entirely in the background. Do not await it!
+                // Its internal IndexedDB saveHooks() call is deadlocking and hanging the thread.
+                Reflector.loadHooksFromSource((window as any).__eqSourceCode).then(() => {
+                    console.log('[EvilLite] Reflector finished parsing!');
                     if ((document as any).highlite?.managers?.HookManager) {
+                        console.log('[EvilLite] HookManager found, binding hooks...');
                         Reflector.bindClassHooks((document as any).highlite.managers.HookManager);
                         Reflector.bindEnumHooks((document as any).highlite.managers.HookManager);
-                        
-                        // Re-initialize manual hooks since classes are now mapped
-                        if ((window as any).highliteInstance) {
-                            (window as any).highliteInstance.initialize();
-                            if (!(window as any).highliteInstanceStarted) {
-                                (window as any).highliteInstanceStarted = true;
-                                await (window as any).highliteInstance.start();
-                            }
-                        }
                     }
-                } catch (err) {
-                    console.error('[EvilLite] Reflector failed to parse modules:', err);
+                }).catch(e => {
+                    console.warn('[EvilLite] Reflector threw an error (ignoring):', e);
+                });
+
+            } catch (err) {
+                console.error('[EvilLite] Reflector failed:', err);
+            } finally {
+                (window as any).__eqIsParsing = false;
+            }
+
+            // COMPLETELY DECOUPLE PLUGIN START FROM REFLECTOR SUCCESS
+            if ((window as any).highliteInstance) {
+                console.log('[EvilLite] highliteInstance found, starting plugins...');
+                (window as any).highliteInstance.initialize();
+                if (!(window as any).highliteInstanceStarted) {
+                    (window as any).highliteInstanceStarted = true;
+                    (window as any).highliteInstance.pluginManager.setLoginState(true);
+                    
+                    // Run start in the background to prevent IndexedDB deadlocks from halting execution
+                    (window as any).highliteInstance.start().catch((e: any) => console.warn('[EvilLite] Core start error:', e));
+                    
+                    // Force start plugins here
+                    (window as any).highliteInstance.pluginManager.initAll();
+                    (window as any).highliteInstance.pluginManager.postInitAll();
+                    (window as any).highliteInstance.pluginManager.startAll();
+                    console.log('[EvilLite] Plugins started successfully!');
                 }
-            }, 500); // debounce by 500ms
+            } else {
+                console.log('[EvilLite] highliteInstance NOT FOUND!');
+            }
+        } else {
+            console.log('[EvilLite] __eqSourceCode is empty or undefined!');
         }
     };
     
@@ -150,7 +136,7 @@ Array.from(doc.head.children).forEach(child => {
         if (child.hasAttribute('href')) {
             const href = child.getAttribute('href');
             if (href && href.startsWith('/assets/')) {
-                child.setAttribute('href', href.replace('/assets/', 'eq://evilquest.net/assets/'));
+                child.setAttribute('href', href.replace('/assets/', 'https://evilquest.net/assets/'));
             } else if (href && href.startsWith('/')) {
                 child.setAttribute('href', 'https://evilquest.net' + href);
             }
@@ -167,7 +153,7 @@ Array.from(doc.body.children).forEach(child => {
         if (child.hasAttribute('href')) {
             const href = child.getAttribute('href');
             if (href && href.startsWith('/assets/')) {
-                child.setAttribute('href', href.replace('/assets/', 'eq://evilquest.net/assets/'));
+                child.setAttribute('href', href.replace('/assets/', 'https://evilquest.net/assets/'));
             } else if (href && href.startsWith('/')) {
                 child.setAttribute('href', 'https://evilquest.net' + href);
             }
@@ -184,23 +170,24 @@ Array.from(doc.body.children).forEach(child => {
 
 // Process and inject scripts manually
 const scripts = doc.querySelectorAll('script');
+console.log(`[EvilLite] Found ${scripts.length} scripts in /play HTML`);
 scripts.forEach(script => {
     const newScript = document.createElement('script');
     Array.from(script.attributes).forEach(attr => {
         newScript.setAttribute(attr.name, attr.value);
     });
     newScript.textContent = script.textContent;
-    
+
     // update script src if relative
     if (newScript.hasAttribute('src')) {
         const src = newScript.getAttribute('src');
         if (src && src.startsWith('/assets/')) {
-            newScript.setAttribute('src', src.replace('/assets/', 'eq://evilquest.net/assets/'));
+            newScript.setAttribute('src', src.replace('/assets/', 'https://evilquest.net/assets/'));
         } else if (src && src.startsWith('/')) {
             newScript.setAttribute('src', 'https://evilquest.net' + src);
         }
     }
-    
+
     // if script was in head, append to head
     if (
         script.parentNode &&
@@ -216,6 +203,7 @@ scripts.forEach(script => {
         }
     }
 });
+console.log('[EvilLite] Script injection complete');
 
 /* Find DOM elements with the attribute to= */
 const toElements = document.querySelectorAll('[to]');
@@ -288,11 +276,11 @@ if (await window.settings.getByName('Enable Plugins')) {
     const loadedPlugins: Array<{ class: any; name: string; }> = [];
 
     try {
-        const pluginModules = import.meta.glob('./plugins/*.js', { eager: true });
+        const pluginModules = import.meta.glob('./plugins/*.{js,ts}', { eager: true });
 
         for (const [path, moduleLoader] of Object.entries(pluginModules)) {
             try {
-                const pluginName = path.split('/').pop()?.replace('.js', '') || 'UnknownPlugin';
+                const pluginName = path.split('/').pop()?.replace(/\.(js|ts)$/, '') || 'UnknownPlugin';
                 // Dynamically import the plugin module
                 const PluginClass = (moduleLoader as any).default;
 
@@ -315,17 +303,12 @@ if (await window.settings.getByName('Enable Plugins')) {
     
     (window as any).highliteInstance = highlite;
 
-    // Defer start until game hooks are available
-    if ((window as any).__eqSourceCode && Object.keys(document.highlite?.gameHooks || {}).length > 0) {
-        highlite.initialize();
-        (window as any).highliteInstanceStarted = true;
-        await highlite.start();
-    }
 } else {
     for (const element of document.getElementsByClassName('highlite-ui')) {
         element.remove();
     }
 }
+
 window.electron.ipcRenderer.send('ui-ready');
 document.dispatchEvent(
     new Event('DOMContentLoaded', {
@@ -333,4 +316,17 @@ document.dispatchEvent(
         cancelable: true,
     })
 );
+
+// Emergency bypass for 'M' key testing while reCAPTCHA is blocked
+window.addEventListener('keydown', (e) => {
+    // 1. Session Reset Hotkey: Ctrl+Shift+R
+    if (e.ctrlKey && e.shiftKey && (e.key === 'r' || e.key === 'R')) {
+        e.preventDefault();
+        console.log('[EvilLite] Triggering reCAPTCHA session reset...');
+        window.electron.ipcRenderer.invoke('reset-captcha-session').then(() => {
+            window.location.reload();
+        });
+        return;
+    }
+}, { capture: true });
 

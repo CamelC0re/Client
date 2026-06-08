@@ -16,6 +16,44 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>. -->
 <!doctype html>
 <html lang="en">
     <head>
+        <script>
+            // ── 1. Removed naive window.chrome spoofing (detectable by reCAPTCHA) ─────────
+
+
+
+            // ── 3. Error logging — surface game engine failures to main process ─────────
+            window.onerror = function(msg, src, line, col, err) {
+                console.error('[GameError]', msg, 'at', src + ':' + line, err?.stack || '');
+            };
+            window.addEventListener('unhandledrejection', function(e) {
+                console.error('[GameRejection]', e.reason?.message || String(e.reason), e.reason?.stack || '');
+            });
+
+            // ── 4. WebSocket URL failsafe + logging ──────────────────────────────────
+            // Patch WebSocket to: (a) upgrade ws:// to wss://, (b) log all connections.
+            try {
+                var _OrigWS = window.WebSocket;
+                function _PatchedWS(url, protocols) {
+                    if (typeof url === 'string') {
+                        var fixed = url.replace(/^ws:\/\/evilquest\.net/, 'wss://evilquest.net');
+                        if (fixed !== url) console.log('[WS-PATCH] ' + url + ' → ' + fixed);
+                        url = fixed;
+                    }
+                    console.log('[WS-CREATE] url=' + url + ' protocols=' + JSON.stringify(protocols));
+                    var ws = protocols !== undefined ? new _OrigWS(url, protocols) : new _OrigWS(url);
+                    ws.addEventListener('open', function() { console.log('[WS-OPEN] ' + url); });
+                    ws.addEventListener('close', function(e) { console.log('[WS-CLOSE] code=' + e.code + ' reason=' + e.reason + ' url=' + url); });
+                    ws.addEventListener('error', function(e) { console.log('[WS-ERROR] ' + url + ' ' + (e.message || '')); });
+                    return ws;
+                }
+                _PatchedWS.prototype = _OrigWS.prototype;
+                _PatchedWS.CONNECTING = _OrigWS.CONNECTING;
+                _PatchedWS.OPEN = _OrigWS.OPEN;
+                _PatchedWS.CLOSING = _OrigWS.CLOSING;
+                _PatchedWS.CLOSED = _OrigWS.CLOSED;
+                window.WebSocket = _PatchedWS;
+            } catch(e) {}
+        </script>
         <script type="importmap">
             {
                 "imports": {

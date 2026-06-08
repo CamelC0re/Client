@@ -15,116 +15,328 @@
 
 import { app, BrowserWindow, ipcMain, shell, session, protocol, net } from 'electron';
 import path from 'path';
-import { format } from 'url';
+import fs from 'fs';
 
-protocol.registerSchemesAsPrivileged([
-    { scheme: 'eq', privileges: { standard: true, secure: true, supportFetchAPI: true, bypassCSP: true, corsEnabled: true } }
-]);
+/**
+ * Builds ONE consistent browser identity used by the JS fingerprint AND every
+ * network header. Two requirements that both matter for reCAPTCHA v3:
+ *   1. Consistency — JS and all headers must agree (mismatch = bot signal).
+ *   2. A common, high-trust profile — Linux/uncommon configs get a lower baseline
+ *      score, so we present as desktop **Windows Chrome** (the profile that was on
+ *      the wire when login last worked), regardless of the host OS.
+ * The Chrome major version is taken from the real Chromium so it matches the engine.
+ */
+function buildBrowserIdentity(nativeUa: string): { ua: string; secChUa: string; platform: string; major: string } {
+    const stripped = (nativeUa || '')
+        .replace(/Electron\/[0-9.]+\s?/g, '')
+        .replace(/EvilLite\/[0-9.]+\s?/gi, '')
+        .trim();
+    const major = stripped.match(/Chrome\/(\d+)/)?.[1] ?? '138';
+    const ua = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
+    const secChUa = `"Not_A Brand";v="8", "Chromium";v="${major}", "Google Chrome";v="${major}"`;
+    return { ua, secChUa, platform: '"Windows"', major };
+}
 
-import './modules/userPasswordManagement'; // Import user password management module
-import './modules/windowEventManagement'; // Import window event management module
+function localMimeType(filePath: string): string {
+    const ext = path.extname(filePath).toLowerCase();
+    const map: Record<string, string> = {
+        '.html': 'text/html', '.js': 'application/javascript',
+        '.css': 'text/css', '.png': 'image/png', '.ico': 'image/x-icon',
+        '.json': 'application/json', '.webm': 'video/webm',
+        '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf',
+    };
+    return map[ext] ?? 'application/octet-stream';
+}
+
+import './modules/userPasswordManagement';
+import './modules/windowEventManagement';
 
 app.commandLine.appendSwitch('disable-background-timer-throttling');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
 app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
+app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
 
-// Reroute any calls to the old website (highlite.dev) to the new one (ryelite.org).
-//  For use with legacy plugins.
-app.on("ready", () => {
-    const filter = { 
-        urls: [
-            "*://highlite.dev/*", 
-            "*://localhost:*/eq-assets/*", 
-            "*://localhost:*/data/*", 
-            "*://localhost:*/maps/*", 
-            "*://localhost:*/ui/*", 
-            "*://localhost:*/api/*"
-        ] 
-    };
-  
-    session.defaultSession.webRequest.onBeforeRequest(filter, (details, callback) => {
-        if (details.url.includes("highlite.dev")) {
-            const newUrl = details.url.replace("highlite.dev", "evillite.net");
-            callback({ redirectURL: newUrl });
-        } else if (details.url.match(/http:\/\/localhost:\d+\/assets\//)) {
-            // intercept Vite's absolute chunk requests in dev mode
-            const newUrl = details.url.replace(/http:\/\/localhost:\d+\/assets\//, "eq://evilquest.net/assets/");
-            callback({ redirectURL: newUrl });
-        } else if (details.url.includes("/eq-assets/")) {
-            // we redirect eq-assets to eq://evilquest.net/assets/
-            const newUrl = details.url.replace(/\/eq-assets\//, "/assets/").replace(/http:\/\/localhost:\d+/, "eq://evilquest.net");
-            callback({ redirectURL: newUrl });
-        } else if (details.url.match(/http:\/\/localhost:\d+\/(data|maps|ui|api)\//)) {
-            const newUrl = details.url.replace(/http:\/\/localhost:\d+/, "eq://evilquest.net");
-            callback({ redirectURL: newUrl });
-        } else {
-            callback({});
-        }
-    });
+app.on("ready", async () => {
+    await session.defaultSession.clearStorageData();
 
-    protocol.handle('eq', async (request) => {
-        let url = request.url.replace('eq://', 'https://');
-        
-        try {
-            const response = await net.fetch(url, {
-                method: request.method,
-                headers: request.headers,
-                body: request.body
-            });
-            
-            let body = await response.text();
-            
-            if (url.endsWith('.js') && response.status === 200) {
-                const classRegex = /\bclass\s+([A-Za-z0-9_]+)/g;
-                const classes = [];
-                let match;
-                while ((match = classRegex.exec(body)) !== null) {
-                    classes.push(match[1]);
+    // Intercept ALL https requests so we can:
+    //   1. Serve /__evillite__/* from local renderer files
+    //   2. Rewrite game JS files (class exposure, URL patching)
+    //   3. Pass everything else (Google, CDNs, etc.) through to the network
+    protocol.handle('https', async (request) => {
+        const url = new URL(request.url);
+
+        // ── 1. Serve EvilLite's own renderer files ─────────────────────────
+        // In dev mode: proxy to Vite dev server for TypeScript transforms + HMR
+        // In production: serve from the built renderer output on disk
+        if (url.hostname === 'evilquest.net' && url.pathname.startsWith('/__evillite__/')) {
+            const filePart = url.pathname.replace('/__evillite__/', '');
+            if (!app.isPackaged) {
+                // Dev mode: proxy to Vite
+                const viteUrl = `http://localhost:5173/${filePart}${url.search}`;
+                try {
+                    return await net.fetch(viteUrl, { bypassCustomProtocolHandlers: true } as any);
+                } catch (err) {
+                    console.error('[Protocol] Vite proxy failed for', filePart, err);
+                    return new Response('Vite proxy failed', { status: 502 });
                 }
-                
-                let exposeCode = `\nif (!document.client) document.client = new Map();\n`;
-                for (const cls of classes) {
-                    exposeCode += `try { document.client.set('${cls}', ${cls}); } catch(e){}\n`;
+            } else {
+                // Production: serve from disk
+                const localPath = path.join(__dirname, '../renderer', filePart);
+                try {
+                    const content = fs.readFileSync(localPath);
+                    return new Response(content, {
+                        headers: { 'Content-Type': localMimeType(localPath), 'Access-Control-Allow-Origin': '*' }
+                    });
+                } catch {
+                    return new Response('EvilLite asset not found: ' + filePart, { status: 404 });
                 }
-                
-                exposeCode += `if (!window.__eqSourceCode) window.__eqSourceCode = "";\n`;
-                exposeCode += `window.__eqSourceCode += ${JSON.stringify(body + "\n")};\n`;
-                exposeCode += `if (window.onEqModuleLoaded) window.onEqModuleLoaded();\n`;
-                
-                body += exposeCode;
-                
-                // Rewrite CSS and data URLs to use eq://
-                body = body.replace(/url\(['"]?\/ui\//g, "url('eq://evilquest.net/ui/");
-                body = body.replace(/(["'])\/data\//g, "$1eq://evilquest.net/data/");
-                body = body.replace(/(["'])\/maps\//g, "$1eq://evilquest.net/maps/");
             }
-            
-            const newHeaders = new Headers(response.headers);
-            newHeaders.set('Access-Control-Allow-Origin', '*');
-            
-            return new Response(body, {
-                headers: newHeaders,
-                status: response.status,
-                statusText: response.statusText
-            });
-        } catch (err) {
-            console.error('[Protocol] Failed to fetch', url, err);
-            return new Response('Fetch failed', { status: 500 });
         }
+
+        // Proxy Vite dev server internal paths (HMR, node_modules, source files)
+        if (!app.isPackaged && url.hostname === 'evilquest.net' &&
+            (url.pathname.startsWith('/@') || 
+             url.pathname.startsWith('/node_modules/') ||
+             url.pathname.startsWith('/client/') ||
+             url.pathname.startsWith('/console/') ||
+             url.pathname.startsWith('/settings/') ||
+             url.pathname.startsWith('/updater/') ||
+             url.pathname.startsWith('/icons/'))) {
+            const viteUrl = `http://localhost:5173${url.pathname}${url.search}`;
+            try {
+                return await net.fetch(viteUrl, { bypassCustomProtocolHandlers: true } as any);
+            } catch {
+                return new Response('Vite proxy failed', { status: 502 });
+            }
+        }
+
+        // ── 2. Proxy evilquest.net requests (game assets, API, /play) ────────
+        if (url.hostname === 'evilquest.net') {
+            const fullUrl = request.url;
+            const isApi = url.pathname.startsWith('/api/') || url.pathname === '/play';
+            const isAsset = url.pathname.startsWith('/assets/');
+
+            if (isAsset) {
+                console.log(`[Protocol-ASSET] ${request.method} ${fullUrl.slice(0, 120)}`);
+            }
+
+            try {
+                // Inject session cookies
+                const cookies = await session.defaultSession.cookies.get({ domain: 'evilquest.net' });
+                const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+                if (isApi) {
+                    console.log(`[Protocol] ${request.method} ${fullUrl}`);
+                    console.log(`[Protocol] cookies sent (${cookies.length}): ${cookies.map(c => c.name).join(', ') || 'none'}`);
+                }
+
+                const outHeaders = new Headers(request.headers);
+                if (cookieHeader) outHeaders.set('Cookie', cookieHeader);
+                outHeaders.set('Origin', 'https://evilquest.net');
+                outHeaders.set('Referer', 'https://evilquest.net/');
+                
+                let outUa = outHeaders.get('User-Agent') || '';
+                if (outUa) {
+                    outUa = outUa.replace(/Electron\/[0-9\.]+\s?/g, '').replace(/EvilLite\/[0-9\.]+\s?/g, '').trim();
+                    outHeaders.set('User-Agent', outUa);
+                }
+
+                // Use bypassCustomProtocolHandlers to avoid infinite recursion
+                const response = await net.fetch(fullUrl, {
+                    method: request.method,
+                    headers: outHeaders,
+                    body: request.body,
+                    duplex: 'half',
+                    bypassCustomProtocolHandlers: true,
+                } as any);
+
+                if (isApi) {
+                    console.log(`[Protocol] response ${response.status} for ${fullUrl}`);
+                }
+
+                // Persist Set-Cookie headers
+                const setCookieValues = response.headers.getSetCookie?.() ?? [];
+                for (const raw of setCookieValues) {
+                    const parts = raw.split(';').map(s => s.trim());
+                    const [name, ...rest] = parts[0].split('=');
+                    if (isApi) console.log(`[Protocol] storing cookie: ${name.trim()}`);
+                    const cookieDetails: Electron.CookiesSetDetails = {
+                        url: 'https://evilquest.net',
+                        name: name.trim(),
+                        value: rest.join('=').trim(),
+                        httpOnly: parts.some(p => p.toLowerCase() === 'httponly'),
+                        secure: parts.some(p => p.toLowerCase() === 'secure'),
+                    };
+                    const maxAgePart = parts.find(p => p.toLowerCase().startsWith('max-age='));
+                    const expiresPart = parts.find(p => p.toLowerCase().startsWith('expires='));
+                    if (maxAgePart) {
+                        const seconds = parseInt(maxAgePart.split('=')[1], 10);
+                        if (!isNaN(seconds)) cookieDetails.expirationDate = Date.now() / 1000 + seconds;
+                    } else if (expiresPart) {
+                        const d = new Date(expiresPart.split('=').slice(1).join('='));
+                        if (!isNaN(d.getTime())) cookieDetails.expirationDate = d.getTime() / 1000;
+                    }
+                    await session.defaultSession.cookies.set(cookieDetails).catch(() => {});
+                }
+
+                const newHeaders = new Headers(response.headers);
+                newHeaders.set('Access-Control-Allow-Origin', '*');
+
+                if (fullUrl.endsWith('.js') && response.status === 200) {
+                    // JS files: class exposure + URL rewriting
+                    let body = await response.text();
+
+                    const classRegex = /\bclass\s+([A-Za-z0-9_]+)/g;
+                    const classes: string[] = [];
+                    let match;
+                    while ((match = classRegex.exec(body)) !== null) {
+                        classes.push(match[1]);
+                    }
+
+                    let exposeCode = `\nif (!document.client) document.client = new Map();\n`;
+                    for (const cls of classes) {
+                        exposeCode += `try { document.client.set('${cls}', ${cls}); } catch(e){}\n`;
+                    }
+                    exposeCode += `if (!window.__eqSourceCode) window.__eqSourceCode = "";\n`;
+                    exposeCode += `window.__eqSourceCode += ${JSON.stringify(body + "\n")};\n`;
+                    exposeCode += `if (window.onEqModuleLoaded) window.onEqModuleLoaded();\n`;
+                    body += exposeCode;
+
+                    // Instrument et() failure to log the exact error
+                    body = body.replace(
+                        /P=null,R=\{pct:0,status:"Failed to prepare game"\}/,
+                        'P=null,R={pct:0,status:"Failed to prepare game"},console.error("[et-FAIL]",e&&e.message,e&&e.stack)'
+                    );
+
+                    return new Response(body, { headers: newHeaders, status: response.status, statusText: response.statusText });
+                } else if (isApi) {
+                    // API responses: log body for diagnostics
+                    const body = await response.text();
+                    if (response.status >= 400) {
+                        console.log(`[Protocol] error body: ${body.slice(0, 400)}`);
+                    } else {
+                        console.log(`[Protocol] response body: ${body.slice(0, 600)}`);
+                    }
+                    return new Response(body, { headers: newHeaders, status: response.status, statusText: response.statusText });
+                } else {
+                    // Binary resources (images, fonts, audio)
+                    const body = await response.arrayBuffer();
+                    return new Response(body, { headers: newHeaders, status: response.status, statusText: response.statusText });
+                }
+            } catch (err) {
+                console.error('[Protocol] Failed to fetch', fullUrl, err);
+                return new Response('Fetch failed', { status: 500 });
+            }
+        }
+
+        // ── 3. Pass through all other HTTPS requests (Google, CDNs, etc.) ────
+        const passHeaders = new Headers(request.headers);
+        const currentReferer = passHeaders.get('Referer') || '';
+        if (currentReferer.includes('__evillite__')) {
+            passHeaders.set('Referer', 'https://evilquest.net/');
+        }
+        
+        // Normalise to one consistent Google-Chrome identity (matches the JS fingerprint).
+        {
+            const id = buildBrowserIdentity(passHeaders.get('User-Agent') || app.userAgentFallback);
+            passHeaders.set('User-Agent', id.ua);
+            passHeaders.set('sec-ch-ua', id.secChUa);
+            passHeaders.set('sec-ch-ua-mobile', '?0');
+            passHeaders.set('sec-ch-ua-platform', id.platform);
+        }
+
+        // Inject cookies for this domain
+        const cookies = await session.defaultSession.cookies.get({ url: request.url });
+        const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+        if (cookieHeader) passHeaders.set('Cookie', cookieHeader);
+        
+        if (request.url.includes('recaptcha/api2/reload')) {
+            console.log(`[reCAPTCHA] Headers sent to Google:`);
+            passHeaders.forEach((value, key) => console.log(`  ${key}: ${value}`));
+        }
+        
+        const response = await net.fetch(request.url, { 
+            method: request.method,
+            headers: passHeaders,
+            body: request.body,
+            duplex: request.method !== 'GET' && request.method !== 'HEAD' ? 'half' : undefined,
+            bypassCustomProtocolHandlers: true 
+        } as any);
+
+        // Persist Set-Cookie headers for Google
+        const setCookieValues = response.headers.getSetCookie?.() ?? [];
+        for (const raw of setCookieValues) {
+            const parts = raw.split(';').map(s => s.trim());
+            const [name, ...rest] = parts[0].split('=');
+            const cookieDetails: Electron.CookiesSetDetails = {
+                url: request.url,
+                name: name.trim(),
+                value: rest.join('=').trim(),
+                httpOnly: parts.some(p => p.toLowerCase() === 'httponly'),
+                secure: parts.some(p => p.toLowerCase() === 'secure'),
+                sameSite: parts.find(p => p.toLowerCase().startsWith('samesite='))?.split('=')[1].toLowerCase() as any || 'unspecified'
+            };
+            const maxAgePart = parts.find(p => p.toLowerCase().startsWith('max-age='));
+            const expiresPart = parts.find(p => p.toLowerCase().startsWith('expires='));
+            if (maxAgePart) {
+                const seconds = parseInt(maxAgePart.split('=')[1], 10);
+                if (!isNaN(seconds)) cookieDetails.expirationDate = Date.now() / 1000 + seconds;
+            } else if (expiresPart) {
+                const d = new Date(expiresPart.split('=').slice(1).join('='));
+                if (!isNaN(d.getTime())) cookieDetails.expirationDate = d.getTime() / 1000;
+            }
+            await session.defaultSession.cookies.set(cookieDetails).catch(() => {});
+        }
+
+        return response;
     });
 });
 
+ipcMain.handle('reset-captcha-session', async () => {
+    console.log('[ReCAPTCHA] Force resetting session cookies and cache...');
+    await session.defaultSession.clearStorageData();
+    await session.defaultSession.clearCache();
+    await session.defaultSession.clearAuthCache();
+    return true;
+});
+
 export async function createClientWindow() {
+    // If RECAPTCHA_PROXY is set (e.g. "socks5://user:pass@host:1080"), route
+    // all traffic through it so reCAPTCHA sees a residential IP.
+    const proxyUrl = process.env.RECAPTCHA_PROXY;
+    if (proxyUrl) {
+        console.log(`[Proxy] Using proxy for reCAPTCHA: ${proxyUrl.replace(/:([^@]+)@/, ':***@')}`);
+        await session.defaultSession.setProxy({ proxyRules: proxyUrl }).catch(console.error);
+    }
+
+    // Start every launch with a FRESH reCAPTCHA reputation. Repeated failed logins
+    // get Google to flag the session's _GRECAPTCHA cookie as abusive, and that bad
+    // score sticks to the cookie. Clearing Google's cookies + cache (NOT evilquest's
+    // session cookies) drops the burned reputation so the next attempt is judged clean.
+    try {
+        await session.defaultSession.clearCache();
+        for (const domain of ['google.com', 'www.google.com', 'gstatic.com', 'www.gstatic.com', 'recaptcha.net']) {
+            const cks = await session.defaultSession.cookies.get({ domain });
+            for (const c of cks) {
+                const host = c.domain?.replace(/^\./, '') ?? domain;
+                await session.defaultSession.cookies.remove(`https://${host}${c.path ?? '/'}`, c.name).catch(() => {});
+            }
+        }
+        console.log('[ReCAPTCHA] cleared Google cookies + cache for a fresh session');
+    } catch (e) {
+        console.error('[ReCAPTCHA] failed to clear Google session', e);
+    }
+
     const mainWindow = new BrowserWindow({
         webPreferences: {
             preload: path.join(__dirname, '../preload/index.js'),
-            sandbox: false, // Disable sandboxing for compatibility with some libraries
+            sandbox: false, // Must be false for @electron-toolkit/preload to work
             contextIsolation: true,
             nodeIntegration: false,
             nodeIntegrationInSubFrames: false,
             nodeIntegrationInWorker: false,
-
-            webSecurity: app.isPackaged, // Disable web security only in development for CORS
+            webSecurity: true, // MUST be true for reCAPTCHA to function correctly
         },
         minHeight: 500,
         minWidth: 500,
@@ -134,28 +346,15 @@ export async function createClientWindow() {
     });
 
     mainWindow.setMenu(null);
-    if (!app.isPackaged && process.env['ELECTRON_RENDERER_URL']) {
-        const devUrl = `${process.env['ELECTRON_RENDERER_URL']}/client.html`;
-        console.log('Loading dev URL:', devUrl);
-        mainWindow.loadURL(devUrl);
-    } else {
-        const fileUrl = format({
-            protocol: 'file',
-            slashes: true,
-            pathname: path.join(__dirname, '../renderer/client.html'),
-            query: { windowId: mainWindow.id },
-        });
+    // Load via https:// so the page origin is genuinely https://evilquest.net
+    // Our protocol.handle('https') intercepts /__evillite__/ and serves local files
+    mainWindow.loadURL('https://evilquest.net/__evillite__/client.html');
 
-        mainWindow.loadURL(fileUrl);
-    }
-
-    // Open Links in External Browser
     mainWindow.webContents.setWindowOpenHandler(({ url }) => {
         shell.openExternal(url);
         return { action: 'deny' };
     });
 
-    // Allow pressing F12 to open dev tools
     mainWindow.webContents.on('before-input-event', (event, input) => {
         if (input.key === 'F12' && input.type === 'keyDown') {
             event.preventDefault();
@@ -163,18 +362,11 @@ export async function createClientWindow() {
         }
     });
 
-    // Enable Zooming Page In and Out
     mainWindow.webContents.on('zoom-changed', (event, zoomDirection) => {
         if (zoomDirection === 'in') {
-            // Increase zoom factor by 0.1 and dispatch a resize event to adjust the layout
-            mainWindow.webContents.setZoomLevel(
-                mainWindow.webContents.getZoomLevel() + 0.1
-            );
+            mainWindow.webContents.setZoomLevel(mainWindow.webContents.getZoomLevel() + 0.1);
         } else if (zoomDirection === 'out') {
-            // Decrease zoom factor by 0.1 and dispatch a resize event to adjust the layout
-            mainWindow.webContents.setZoomLevel(
-                mainWindow.webContents.getZoomLevel() - 0.1
-            );
+            mainWindow.webContents.setZoomLevel(mainWindow.webContents.getZoomLevel() - 0.1);
         }
     });
 
@@ -187,31 +379,58 @@ export async function createClientWindow() {
         });
     });
 
-    // In development, modify requests to High Spell servers
-    if (!app.isPackaged) {
-        // Set user agent and origin for High Spell compatibility
-        mainWindow.webContents.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        );
+    // Present a consistent desktop Windows Chrome identity (real major version) on the
+    // top frame too, so navigator.userAgent matches the headers and the JS fingerprint.
+    mainWindow.webContents.setUserAgent(buildBrowserIdentity(mainWindow.webContents.getUserAgent()).ua);
 
-        mainWindow.webContents.session.webRequest.onBeforeSendHeaders(
-            (details, callback) => {
-                if (details.url.includes('evilquest.net')) {
-                    details.requestHeaders['Origin'] = 'https://evilquest.net';
-                    details.requestHeaders['Referer'] =
-                        'https://evilquest.net/';
-                }
-                callback({ requestHeaders: details.requestHeaders });
+    // 1. Spoof User-Agent and Client Hints for ALL requests globally to pass reCAPTCHA
+    mainWindow.webContents.session.webRequest.onBeforeSendHeaders(
+        (details, callback) => {
+            const isWs = (details as any).resourceType === 'websocket'
+                || details.requestHeaders['Upgrade'] === 'websocket'
+                || details.requestHeaders['upgrade'] === 'websocket';
+                
+            if (isWs) {
+                details.requestHeaders['Origin'] = 'https://evilquest.net';
+                details.requestHeaders['Referer'] = 'https://evilquest.net/';
             }
-        );
-    }
+
+            // Normalise to the SAME consistent Google-Chrome identity used by the
+            // https proxy and the JS fingerprint (real version + platform, no Electron).
+            const id = buildBrowserIdentity(details.requestHeaders['User-Agent'] || app.userAgentFallback);
+            details.requestHeaders['User-Agent'] = id.ua;
+            details.requestHeaders['sec-ch-ua'] = id.secChUa;
+            details.requestHeaders['sec-ch-ua-mobile'] = '?0';
+            details.requestHeaders['sec-ch-ua-platform'] = id.platform;
+
+            callback({ requestHeaders: details.requestHeaders });
+        }
+    );
+
+    // Log all network errors
+    mainWindow.webContents.session.webRequest.onErrorOccurred(
+        (details) => {
+            if (!details.url.includes('fonts.g') && !details.url.includes('gstatic')) {
+                console.log(`[WebRequest ERROR] ${details.resourceType ?? ''} ${details.url} → ${details.error}`);
+            }
+        }
+    );
+
+    // Log all completed requests, except quiet assets
+    mainWindow.webContents.session.webRequest.onCompleted(
+        (details) => {
+            const skip = ['.css', '.woff', '.webm', '.svg', '.ttf', 'fonts.googleapis', 'fonts.gstatic'];
+            const isQuiet = skip.some(ext => details.url.includes(ext));
+            // Always log errors; log non-quiet requests
+            if (!isQuiet || details.statusCode >= 400) {
+                console.log(`[WebRequest] ${details.method} ${details.url.slice(0, 120)} → ${details.statusCode}`);
+            }
+        }
+    );
 
     mainWindow.on('ready-to-show', () => {
-        // Always start with zoom reset to 0.0
         mainWindow.webContents.setZoomLevel(0);
     });
-
-    
 
     return mainWindow;
 }
