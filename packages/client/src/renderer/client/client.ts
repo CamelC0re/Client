@@ -316,6 +316,25 @@ document.dispatchEvent(
     })
 );
 
+// Lightweight on-screen toast for dev-login status (no copy-paste UI needed).
+function devToast(msg: string, kind: 'info' | 'ok' | 'err' = 'info') {
+    let el = document.getElementById('evillite-dev-toast');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'evillite-dev-toast';
+        el.style.cssText = [
+            'position:fixed', 'bottom:16px', 'right:16px', 'z-index:2147483647',
+            'padding:10px 14px', 'border-radius:8px', 'font:13px/1.4 system-ui,sans-serif',
+            'color:#fff', 'max-width:340px', 'box-shadow:0 4px 16px rgba(0,0,0,.4)',
+            'pointer-events:none', 'white-space:pre-wrap',
+        ].join(';');
+        document.body.appendChild(el);
+    }
+    el.style.background = kind === 'ok' ? '#1e7e34' : kind === 'err' ? '#a02020' : '#222';
+    el.textContent = msg;
+    el.style.opacity = '1';
+}
+
 // Emergency bypass for 'M' key testing while reCAPTCHA is blocked
 window.addEventListener('keydown', (e) => {
     // 1. Session Reset Hotkey: Ctrl+Shift+R
@@ -325,6 +344,22 @@ window.addEventListener('keydown', (e) => {
         window.electron.ipcRenderer.invoke('reset-captcha-session').then(() => {
             window.location.reload();
         });
+        return;
+    }
+
+    // 2. DEV Browser Login: Ctrl+Shift+L
+    //    Pops out real Chrome to log in past reCAPTCHA, captures the session,
+    //    injects it back into this client, and reloads — no copy-paste.
+    if (e.ctrlKey && e.shiftKey && (e.key === 'l' || e.key === 'L')) {
+        e.preventDefault();
+        devToast('Opening Chrome — log in there. Capturing your session…');
+        window.electron.ipcRenderer.invoke('dev-login:start').then((res: any) => {
+            if (res?.ok) {
+                devToast('Logged in! Captured: ' + (res.captured || []).join(', ') + '\nReloading…', 'ok');
+            } else {
+                devToast('Dev login failed: ' + (res?.error || 'unknown error'), 'err');
+            }
+        }).catch((err: any) => devToast('Dev login error: ' + err, 'err'));
         return;
     }
 }, { capture: true });

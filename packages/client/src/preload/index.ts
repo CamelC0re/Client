@@ -20,37 +20,39 @@ import { webFrame, contextBridge, ipcRenderer } from 'electron';
 // real browser. Runs in the MAIN world (contextIsolation is on). Every override is
 // individually try/caught so one failure never aborts the rest.
 //
-// IMPORTANT: keep the brand/version numbers consistent with each other and with the
-// network User-Agent set in the main process (Chrome 120 / Windows).
-webFrame.executeJavaScript(`
+// EXPERIMENT: all JS fingerprint overrides are DISABLED. Incognito Chrome (no spoofing)
+// passes on this exact IP while our spoofed client fails — which means our overrides are
+// the tell: overriding navigator props leaves non-native getters/functions that reCAPTCHA
+// can detect, and a clean browser has none. So present pure, untampered Electron/Chromium.
+false && webFrame.executeJavaScript(`
 (function () {
     var def = function (obj, prop, getter) { try { Object.defineProperty(obj, prop, { get: getter, configurable: true }); } catch (e) {} };
 
-    // Present ONE consistent desktop **Windows** Chrome identity across JS + every
-    // network header (the main process forces the same Windows UA + Client-Hint
-    // headers). Windows is the common, high-trust profile for reCAPTCHA v3; a
-    // consistent Linux profile scores lower. The Chrome major version is taken from
-    // the real engine so it matches.
-    var major = (navigator.userAgent.match(/Chrome\\/(\\d+)/) || [])[1] || '138';
-    var fullVer = major + '.0.0.0';
-    var winUa = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + fullVer + ' Safari/537.36';
+    // Present the REAL, honest platform — exactly what an ordinary Chrome on this same
+    // machine reports — instead of faking Windows. A real Chrome browser on this box
+    // logs in fine; our previous Windows spoof on a Linux machine was an inconsistency
+    // reCAPTCHA could detect (claimed Windows, but real WebGL/engine behaviour = Linux).
+    // So we DON'T override userAgent/platform/WebGL anymore — we only (a) ensure the
+    // automation flag is off, (b) add the "Google Chrome" brand to Client Hints (Electron
+    // reports "Chromium" only) at the REAL version + REAL platform, and (c) fill window.chrome.
+    var ua = navigator.userAgent || '';
+    var major = (ua.match(/Chrome\\/(\\d+)/) || [])[1] || '138';
+    var fullVer = (ua.match(/Chrome\\/([\\d.]+)/) || [])[1] || (major + '.0.0.0');
+    var isWin = /Windows/i.test(ua), isMac = /Mac OS X|Macintosh/i.test(ua);
+    var chPlatform = isWin ? 'Windows' : (isMac ? 'macOS' : 'Linux');
+    var platVer = isWin ? '15.0.0' : (isMac ? '13.6.0' : '6.8.0');
 
-    // 0. Kill the automation flag explicitly (belt-and-suspenders alongside the
-    //    disable-blink-features switch).
+    // 0. Automation flag off (matches a real browser; belt-and-suspenders with the switch).
     def(navigator, 'webdriver', function () { return false; });
-
-    // 1. User-Agent family — all Windows, all consistent.
-    def(navigator, 'userAgent', function () { return winUa; });
-    def(navigator, 'appVersion', function () { return winUa.replace('Mozilla/', ''); });
-    def(navigator, 'platform', function () { return 'Win32'; });
     def(navigator, 'vendor', function () { return 'Google Inc.'; });
-    // Match the US-English locale our Windows identity implies (consistency, not a spoof).
     def(navigator, 'languages', function () { return ['en-US', 'en']; });
     def(navigator, 'language', function () { return 'en-US'; });
+    // NOTE: we deliberately do NOT override navigator.userAgent / appVersion / platform —
+    // they're the real values (the main process only strips "Electron"), so they stay
+    // consistent with the actual engine, exactly like a normal Chrome.
 
-    // 1b. Notification/permissions consistency. The classic headless tell is
-    //     Notification.permission === 'default' while permissions.query(notifications)
-    //     resolves to 'denied'. Real Chrome returns 'prompt'. Keep them aligned.
+    // 1b. Notification/permissions consistency (the classic headless tell: permission
+    //     'default' but query() resolves 'denied'; real Chrome returns 'prompt').
     try {
         if (window.Notification && Notification.permission === 'default' && navigator.permissions && navigator.permissions.query) {
             var origQuery = navigator.permissions.query.bind(navigator.permissions);
@@ -61,7 +63,8 @@ webFrame.executeJavaScript(`
         }
     } catch (e) {}
 
-    // 2. Client Hints — Windows, with the Google Chrome brand (Electron omits it).
+    // 2. Client Hints — keep the REAL platform/version, just add the "Google Chrome"
+    //    brand (Electron's brand list has Chromium but not Google Chrome).
     var brands = [
         { brand: 'Not_A Brand', version: '8' },
         { brand: 'Chromium', version: major },
@@ -70,7 +73,7 @@ webFrame.executeJavaScript(`
     var uaData = {
         brands: brands,
         mobile: false,
-        platform: 'Windows',
+        platform: chPlatform,
         getHighEntropyValues: function () {
             return Promise.resolve({
                 architecture: 'x86', bitness: '64', brands: brands,
@@ -79,11 +82,11 @@ webFrame.executeJavaScript(`
                     { brand: 'Chromium', version: fullVer },
                     { brand: 'Google Chrome', version: fullVer }
                 ],
-                mobile: false, model: '', platform: 'Windows',
-                platformVersion: '15.0.0', uaFullVersion: fullVer, wow64: false
+                mobile: false, model: '', platform: chPlatform,
+                platformVersion: platVer, uaFullVersion: fullVer, wow64: false
             });
         },
-        toJSON: function () { return { brands: brands, mobile: false, platform: 'Windows' }; }
+        toJSON: function () { return { brands: brands, mobile: false, platform: chPlatform }; }
     };
     def(navigator, 'userAgentData', function () { return uaData; });
 
@@ -102,25 +105,8 @@ webFrame.executeJavaScript(`
         try { window.chrome = c; } catch (e) {}
     } catch (e) {}
 
-    // 4. WebGL — report a real Windows GPU (consistent with the Windows identity);
-    //    masks the dev box's software renderer, which is a bot signal.
-    try {
-        var VENDOR = 37445, RENDERER = 37446; // UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL
-        var spoofVendor = 'Google Inc. (NVIDIA)';
-        var spoofRenderer = 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Ti Direct3D11 vs_5_0 ps_5_0, D3D11)';
-        var patchGL = function (proto) {
-            if (!proto || proto.__eqGlPatched) return;
-            var orig = proto.getParameter;
-            proto.getParameter = function (p) {
-                if (p === VENDOR) return spoofVendor;
-                if (p === RENDERER) return spoofRenderer;
-                return orig.apply(this, arguments);
-            };
-            proto.__eqGlPatched = true;
-        };
-        if (typeof WebGLRenderingContext !== 'undefined') patchGL(WebGLRenderingContext.prototype);
-        if (typeof WebGL2RenderingContext !== 'undefined') patchGL(WebGL2RenderingContext.prototype);
-    } catch (e) {}
+    // 4. WebGL — NO spoof. With hardware GL we report the real GPU, exactly like the
+    //    real browser. (Faking a Windows D3D11 GPU on a Linux machine was the tell.)
 })();
 `);
 

@@ -18,23 +18,25 @@ import path from 'path';
 import fs from 'fs';
 
 /**
- * Builds ONE consistent browser identity used by the JS fingerprint AND every
- * network header. Two requirements that both matter for reCAPTCHA v3:
- *   1. Consistency — JS and all headers must agree (mismatch = bot signal).
- *   2. A common, high-trust profile — Linux/uncommon configs get a lower baseline
- *      score, so we present as desktop **Windows Chrome** (the profile that was on
- *      the wire when login last worked), regardless of the host OS.
- * The Chrome major version is taken from the real Chromium so it matches the engine.
+ * Builds one consistent browser identity used by the JS fingerprint AND every network
+ * header — matching what an ordinary Chrome on this same machine reports. We present
+ * the REAL platform (just stripping "Electron"/"EvilLite" and adding the "Google
+ * Chrome" brand), NOT a faked Windows one. A real browser on this box passes reCAPTCHA;
+ * faking Windows on a Linux machine was an inconsistency reCAPTCHA could detect, so we
+ * stop lying about the OS and stay honest + consistent across JS and the wire.
  */
 function buildBrowserIdentity(nativeUa: string): { ua: string; secChUa: string; platform: string; major: string } {
-    const stripped = (nativeUa || '')
+    const ua = (nativeUa || '')
         .replace(/Electron\/[0-9.]+\s?/g, '')
         .replace(/EvilLite\/[0-9.]+\s?/gi, '')
         .trim();
-    const major = stripped.match(/Chrome\/(\d+)/)?.[1] ?? '138';
-    const ua = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
+    const major = ua.match(/Chrome\/(\d+)/)?.[1] ?? '138';
+    // Real platform, derived from the (Electron-stripped) UA.
+    let platform = '"Linux"';
+    if (/Windows/i.test(ua)) platform = '"Windows"';
+    else if (/Mac OS X|Macintosh/i.test(ua)) platform = '"macOS"';
     const secChUa = `"Not_A Brand";v="8", "Chromium";v="${major}", "Google Chrome";v="${major}"`;
-    return { ua, secChUa, platform: '"Windows"', major };
+    return { ua, secChUa, platform, major };
 }
 
 function localMimeType(filePath: string): string {
@@ -51,6 +53,11 @@ function localMimeType(filePath: string): string {
 import './modules/userPasswordManagement';
 import './modules/windowEventManagement';
 import { settingsService } from '../../modules/settingsManagement';
+import { registerDevLogin } from '../../devLogin';
+
+// DEV-ONLY: seamless browser-login session relay (Ctrl+Shift+L in the client).
+// Pops out real Chrome to log in past reCAPTCHA, captures the session, injects it.
+registerDevLogin();
 
 app.commandLine.appendSwitch('disable-background-timer-throttling');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
@@ -240,11 +247,10 @@ app.on("ready", async () => {
         
         // Normalise to one consistent Google-Chrome identity (matches the JS fingerprint).
         {
+            // EXPERIMENT: let native Client-Hint headers flow (matching the now-native JS);
+            // only keep the UA Electron-stripped (setUserAgent already does this natively).
             const id = buildBrowserIdentity(passHeaders.get('User-Agent') || app.userAgentFallback);
             passHeaders.set('User-Agent', id.ua);
-            passHeaders.set('sec-ch-ua', id.secChUa);
-            passHeaders.set('sec-ch-ua-mobile', '?0');
-            passHeaders.set('sec-ch-ua-platform', id.platform);
         }
 
         // Inject cookies for this domain
@@ -319,7 +325,7 @@ export async function createClientWindow() {
     //        recovering from a flagged/burned session, but reCAPTCHA never builds trust.
     //  OFF → keep the cookie so reCAPTCHA accumulates trust across logins (recommended).
     // Either way we only touch Google's cookies, never evilquest's session.
-    const clearRecaptcha = settingsService.get('Login', 'Clear reCAPTCHA session each launch');
+    const clearRecaptcha = settingsService.get('Login', 'Clear reCAPTCHA session each launch') || process.env.EQ_FRESH === '1';
     if (clearRecaptcha) {
         try {
             await session.defaultSession.clearCache();
@@ -409,9 +415,6 @@ export async function createClientWindow() {
             // https proxy and the JS fingerprint (real version + platform, no Electron).
             const id = buildBrowserIdentity(details.requestHeaders['User-Agent'] || app.userAgentFallback);
             details.requestHeaders['User-Agent'] = id.ua;
-            details.requestHeaders['sec-ch-ua'] = id.secChUa;
-            details.requestHeaders['sec-ch-ua-mobile'] = '?0';
-            details.requestHeaders['sec-ch-ua-platform'] = id.platform;
 
             callback({ requestHeaders: details.requestHeaders });
         }
