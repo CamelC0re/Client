@@ -114,6 +114,7 @@ export default class WorldMapPlugin extends Plugin {
     private centerZ = 0;
     private zoom = 4;
     private followPlayer = true;
+    private currentFloor = 0;
 
     // ── Discovered/accumulated data ───────────────────────────────────────────────
     /** Persistent object store for the current map: key `${x},${z},${floor},${defId}`. */
@@ -143,6 +144,7 @@ export default class WorldMapPlugin extends Plugin {
 
     private hitTargets: HitTarget[] = [];
     private hoverPos: { x: number; y: number } | null = null;
+    private floorLabelEl: HTMLSpanElement | null = null;
 
     private static readonly NPC_CAT = '__npc__';
     private static readonly MAX_SIGHTINGS_PER_NPC = 240;
@@ -592,6 +594,12 @@ export default class WorldMapPlugin extends Plugin {
     }
 
     // ── Overlay UI ────────────────────────────────────────────────────────────────
+    private updateFloorLabel() {
+        if (this.floorLabelEl) {
+            this.floorLabelEl.innerText = `Floor: ${this.currentFloor}`;
+        }
+    }
+
     private createMapOverlay() {
         if (this.mapOverlay) return;
 
@@ -630,16 +638,36 @@ export default class WorldMapPlugin extends Plugin {
         const followBtn = document.createElement('button');
         followBtn.innerText = 'Follow: ON';
         this.styleButton(followBtn, '#2c3e50');
-        followBtn.onclick = () => { this.followPlayer = !this.followPlayer; followBtn.innerText = `Follow: ${this.followPlayer ? 'ON' : 'OFF'}`; };
+        const setFollow = (on: boolean) => {
+            this.followPlayer = on;
+            followBtn.innerText = `Follow: ${on ? 'ON' : 'OFF'}`;
+        };
+        followBtn.onclick = () => setFollow(!this.followPlayer);
 
         const closeBtn = document.createElement('button');
         closeBtn.innerText = 'Close';
         this.styleButton(closeBtn, 'var(--theme-danger, #e74c3c)');
         closeBtn.onclick = () => this.toggleMap(false);
 
+        const floorDownBtn = document.createElement('button');
+        floorDownBtn.innerText = '▼';
+        this.styleButton(floorDownBtn, '#2c3e50');
+        floorDownBtn.title = 'Floor Down';
+        floorDownBtn.onclick = () => { setFollow(false); this.currentFloor--; this.worldCanvas = null; this.updateFloorLabel(); };
+
+        this.floorLabelEl = document.createElement('span');
+        this.updateFloorLabel();
+        Object.assign(this.floorLabelEl.style, { fontWeight: 'bold', minWidth: '60px', textAlign: 'center', userSelect: 'none' } as CSSStyleDeclaration);
+
+        const floorUpBtn = document.createElement('button');
+        floorUpBtn.innerText = '▲';
+        this.styleButton(floorUpBtn, '#2c3e50');
+        floorUpBtn.title = 'Floor Up';
+        floorUpBtn.onclick = () => { setFollow(false); this.currentFloor++; this.worldCanvas = null; this.updateFloorLabel(); };
+
         const right = document.createElement('div');
         Object.assign(right.style, { display: 'flex', gap: '8px', alignItems: 'center' } as CSSStyleDeclaration);
-        right.append(followBtn, closeBtn);
+        right.append(floorDownBtn, this.floorLabelEl, floorUpBtn, followBtn, closeBtn);
         header.append(title, this.searchInput, jumpBtn, right);
 
         // Full-width status strip below the header (never truncated).
@@ -898,11 +926,51 @@ export default class WorldMapPlugin extends Plugin {
                 this.hoverPos = null;
             }
         });
-        // Click a marker -> centre on it.
+        // Click a marker -> centre on it, OR click ground -> walk there.
         canvas.addEventListener('click', () => {
             if (moved || !this.hoverPos) return;
             const hit = this.pickHit(this.hoverPos.x, this.hoverPos.y);
-            if (hit) { this.centerX = hit.wx; this.centerZ = hit.wz; this.followPlayer = false; }
+            if (hit) { 
+                this.centerX = hit.wx; 
+                this.centerZ = hit.wz; 
+                
+                // Also update the UI button when we stop following
+                if (this.followPlayer) {
+                    this.followPlayer = false;
+                    const btn = this.mapOverlay?.querySelector('button') as HTMLButtonElement;
+                    // The follow button is one of the buttons, we should ideally use the setFollow we created, but this works:
+                    const followBtn = [...(this.mapOverlay?.querySelectorAll('button') ?? [])].find(b => b.innerText.startsWith('Follow:'));
+                    if (followBtn) followBtn.innerText = 'Follow: OFF';
+                }
+            } else {
+                // Ground click -> walk there
+                const rect = canvas.getBoundingClientRect();
+                const z = this.zoom;
+                const dw = Math.max(1, Math.floor(rect.width));
+                const dh = Math.max(1, Math.floor(rect.height));
+                const srcLeft = this.centerX - dw / (2 * z);
+                const srcTop = this.centerZ - dh / (2 * z);
+                
+                let worldX = srcLeft + this.hoverPos.x / z;
+                let worldZ = srcTop + this.hoverPos.y / z;
+                
+                const player = this.getPlayerPos();
+                if (player) {
+                    const dx = worldX - player.x;
+                    const dz = worldZ - player.z;
+                    const dist = Math.sqrt(dx * dx + dz * dz);
+                    const MAX_OVERLAY_DIST = 80;
+                    if (dist > MAX_OVERLAY_DIST) {
+                        const ratio = MAX_OVERLAY_DIST / dist;
+                        worldX = player.x + dx * ratio;
+                        worldZ = player.z + dz * ratio;
+                    }
+                }
+                
+                if (this.gm?.minimap?.onClickMove) {
+                    this.gm.minimap.onClickMove(worldX, worldZ, worldX, worldZ);
+                }
+            }
         });
     }
 
@@ -954,6 +1022,59 @@ export default class WorldMapPlugin extends Plugin {
     private lastPaintedSize = -1;
     private lastRebuild = 0;
 
+    private getTilesForFloor(cm: any, cx: number, cz: number, radius: number, floor: number) {
+        if (floor === 0 || typeof cm.floorLayerData?.get !== 'function') {
+            return cm.getTilesForMinimap(cx, cz, radius);
+        }
+
+        const size = radius * 2;
+        const startX = Math.floor(cx) - radius;
+        const startZ = Math.floor(cz) - radius;
+        
+        const buf = {
+            tiles: new Uint8Array(size * size),
+            walls: new Uint8Array(size * size),
+            voidTiles: new Uint8Array(size * size),
+            roofs: new Uint8Array(size * size),
+            textured: new Uint8Array(size * size),
+            overrideColors: new Uint8Array(size * size * 3),
+            hasOverride: new Uint8Array(size * size),
+            size, startX, startZ
+        };
+        
+        buf.voidTiles.fill(1);
+        
+        const layer = cm.floorLayerData.get(floor);
+        if (!layer) return buf;
+        
+        for (let z = 0; z < size; z++) {
+            for (let x = 0; x < size; x++) {
+                const worldX = startX + x;
+                const worldZ = startZ + z;
+                if (worldX < 0 || worldX >= cm.mapWidth || worldZ < 0 || worldZ >= cm.mapHeight) continue;
+                
+                const idx = worldZ * cm.mapWidth + worldX;
+                const localIdx = z * size + x;
+                
+                const hasTile = layer.tiles?.has(idx);
+                const hasFloor = layer.floors?.has(idx);
+                const hasWall = layer.walls?.has(idx);
+                const hasRoof = layer.roofs?.has(idx);
+                const hasStair = layer.stairs?.has(idx);
+                
+                if (hasTile || hasFloor || hasWall || hasRoof || hasStair) {
+                    buf.voidTiles[localIdx] = 0;
+                    buf.tiles[localIdx] = layer.tiles?.get(idx) ?? layer.floors?.get(idx) ?? 0;
+                    buf.walls[localIdx] = layer.walls?.get(idx) ?? 0;
+                    if (hasRoof) buf.roofs[localIdx] = 1;
+                    if (hasFloor || hasStair) buf.textured[localIdx] = 1;
+                }
+            }
+        }
+        
+        return buf;
+    }
+
     private rebuildWorldCanvas(cm: any): boolean {
         const mapW = cm.mapWidth | 0;
         const mapH = cm.mapHeight | 0;
@@ -987,7 +1108,7 @@ export default class WorldMapPlugin extends Plugin {
         else { const p = this.getPlayerPos(); cx = p ? p.x : mapW / 2; cz = p ? p.z : mapH / 2; }
 
         let buf: any;
-        try { buf = cm.getTilesForMinimap(cx, cz, radius); } catch { return this.lastPaintedSize >= 0; }
+        try { buf = this.getTilesForFloor(cm, cx, cz, radius, this.currentFloor); } catch { return this.lastPaintedSize >= 0; }
         if (!buf) return false;
 
         const { tiles, walls, roofs, textured, voidTiles, overrideColors, hasOverride, size, startX, startZ } = buf;
@@ -1083,7 +1204,7 @@ export default class WorldMapPlugin extends Plugin {
                     const vt = Ot - ht;
                     
                     // The vanilla game minimap uses a fast additive model, not multiplicative!
-                    const fi = (-ut * 0.7 - vt * 0.7) * 30;
+                    const fi = this.currentFloor === 0 ? (-ut * 0.7 - vt * 0.7) * 30 : 0;
                     
                     r = clamp(r + noise + fi);
                     g = clamp(g + noise + fi);
@@ -1143,6 +1264,15 @@ export default class WorldMapPlugin extends Plugin {
 
         if (!cm) { this.setStatus('Waiting for game… (log in to view the map)'); return; }
 
+        if (this.followPlayer && typeof cm.getCurrentFloor === 'function') {
+            const gmFloor = cm.getCurrentFloor();
+            if (this.currentFloor !== gmFloor) {
+                this.currentFloor = gmFloor;
+                this.worldCanvas = null; // force rebuild
+                this.updateFloorLabel();
+            }
+        }
+
         const built = this.rebuildWorldCanvas(cm);
         if (!built || !this.worldCanvas) { this.setStatus('Map data not loaded yet…'); return; }
 
@@ -1192,7 +1322,20 @@ export default class WorldMapPlugin extends Plugin {
         // Minimap markers (developer POIs — toggleable layer).
         if (this.showMinimapMarkers) this.drawMinimapMarkers(ctx, dw, dh, srcLeft, srcTop, z);
 
-        if (player) this.drawPlayerMarker(ctx, (player.x - srcLeft) * z, (player.z - srcTop) * z);
+        const playerFloor = typeof cm.getCurrentFloor === 'function' ? cm.getCurrentFloor() : 0;
+        if (player && playerFloor === this.currentFloor) {
+            this.drawPlayerMarker(ctx, (player.x - srcLeft) * z, (player.z - srcTop) * z);
+        }
+
+        const minimap = this.gm?.minimap;
+        if (minimap && minimap.destX !== null && minimap.destZ !== null) {
+            // The destination marker is visible on whatever floor the player is on.
+            if (playerFloor === this.currentFloor) {
+                const dx = (minimap.destX - srcLeft) * z;
+                const dz = (minimap.destZ - srcTop) * z;
+                this.drawDestinationMarker(ctx, dx, dz, minimap.destAnimTime ?? 0);
+            }
+        }
 
         // Hover tooltip.
         this.updateTooltip();
@@ -1751,6 +1894,7 @@ export default class WorldMapPlugin extends Plugin {
     private drawMinimapMarkers(ctx: CanvasRenderingContext2D, dw: number, dh: number, srcLeft: number, srcTop: number, z: number) {
         const pad = 20;
         for (const m of this.minimapMarkers) {
+            if ((m as any).floor !== undefined && (m as any).floor !== this.currentFloor) continue;
             const sx = (m.x + 0.5 - srcLeft) * z;
             const sy = (m.z + 0.5 - srcTop) * z;
             if (sx < -pad || sx > dw + pad || sy < -pad || sy > dh + pad) continue;
@@ -1859,6 +2003,7 @@ export default class WorldMapPlugin extends Plugin {
                 for (const s of m.values()) {
                     // Skip if there is a live NPC of this def right here (avoid double).
                     if (this.liveNpcKeys.has(`${defId}:${s.x},${s.z}`)) continue;
+                    if ((s as any).floor !== undefined && (s as any).floor !== this.currentFloor) continue;
                     const sx = (s.x + 0.5 - srcLeft) * z, sy = (s.z + 0.5 - srcTop) * z;
                     if (!inView(sx, sy)) continue;
                     if (useIcon) this.drawIcon(ctx, icon!, sx, sy, sz, 0.5);
@@ -1872,6 +2017,7 @@ export default class WorldMapPlugin extends Plugin {
         //    tile at its exact coordinate, with a count badge when several share it.
         const tileGroups = new Map<string, MapObject[]>();
         for (const o of this.objectStore.values()) {
+            if (o.floor !== undefined && o.floor !== this.currentFloor) continue;
             if (!this.nameEnabled(o.category, o.name)) continue;
             if (q && !(o.name.toLowerCase().includes(q) || o.category.toLowerCase().includes(q))) continue;
             const tk = `${o.x},${o.z},${o.floor}`;
@@ -1916,6 +2062,7 @@ export default class WorldMapPlugin extends Plugin {
         // 3) Live NPCs (bright), with combat level.
         if (this.showLiveNpcs) {
             for (const n of this.liveNpcs) {
+                if (n.floor !== undefined && n.floor !== this.currentFloor) continue;
                 if (this.disabledNames.has(`${WorldMapPlugin.NPC_CAT}:${n.name}`) || this.disabledCats.has(WorldMapPlugin.NPC_CAT)) continue;
                 if (q && !n.name.toLowerCase().includes(q)) continue;
                 const sx = (n.x - srcLeft) * z, sy = (n.z - srcTop) * z;
@@ -2016,6 +2163,59 @@ export default class WorldMapPlugin extends Plugin {
         ctx.strokeText(text, x, y);
         ctx.fillStyle = color;
         ctx.fillText(text, x, y);
+        ctx.restore();
+    }
+
+    private drawDestinationMarker(ctx: CanvasRenderingContext2D, x: number, y: number, animTime: number) {
+        const s = animTime;
+        const n = (Math.sin(s * 8) + 1) * 0.5;
+        const o = Math.max(0, 1 - s / 0.55);
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.lineJoin = 'round';
+        if (o > 0) {
+            ctx.globalAlpha = 0.65 * o;
+            ctx.strokeStyle = '#fff0b8';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.arc(0, 0, 7 + (1 - o) * 17, 0, Math.PI * 2);
+            ctx.stroke();
+        }
+        ctx.globalAlpha = 0.26 + n * 0.2;
+        ctx.strokeStyle = '#ffdf64';
+        ctx.lineWidth = 1.75;
+        ctx.shadowColor = 'rgba(255, 210, 80, 0.55)';
+        ctx.shadowBlur = 3 + n * 2;
+        ctx.beginPath();
+        ctx.arc(0, 0, 7.5 + n * 1.2, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        ctx.shadowBlur = 0;
+        ctx.lineCap = 'square';
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.72)';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(0, -17);
+        ctx.lineTo(0, 0);
+        ctx.stroke();
+        ctx.strokeStyle = '#f7ead1';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(0, -17);
+        ctx.lineTo(0, 0);
+        ctx.stroke();
+        ctx.fillStyle = '#d8372b';
+        ctx.strokeStyle = '#230b07';
+        ctx.lineWidth = 1.25;
+        ctx.shadowColor = 'rgba(0, 0, 0, 0.35)';
+        ctx.shadowBlur = 2;
+        ctx.beginPath();
+        ctx.moveTo(1, -17);
+        ctx.lineTo(10, -14);
+        ctx.lineTo(1, -10);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
         ctx.restore();
     }
 
