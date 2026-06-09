@@ -939,8 +939,9 @@ export default class WorldMapPlugin extends Plugin {
     };
     private static readonly TEXTURED_COLOR = [138, 116, 82]; // Nf
     private static readonly ROOF_COLOR = [96, 64, 34];       // Df — matches game exactly
-    // Wall direction bitmask (F enum in the game): N=1, S=2, W=4, E=8.
-    private static readonly WF = { N: 1, S: 2, W: 4, E: 8 };
+    // Wall direction bitmask (F enum in the game): N=1, E=2, S=4, W=8 (Clockwise).
+    // This aligns perfectly with the game's checks: (wf & 5) === 5 is N+S, (wf & 10) === 10 is E+W.
+    private static readonly WF = { N: 1, E: 2, S: 4, W: 8 };
     // Wall-edge line color — RGB(220,216,200): warm cream, same as game minimap white lines.
     private static readonly WALL_LINE = [220, 216, 200];
 
