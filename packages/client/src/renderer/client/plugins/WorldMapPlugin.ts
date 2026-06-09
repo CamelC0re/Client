@@ -1009,6 +1009,35 @@ export default class WorldMapPlugin extends Plugin {
             }
         }
 
+        // ── Pre-pass: flatten wall/bridge vertex heights ─────────────────────────────
+        for (let f = 0; f < size; f++) {
+            for (let m = 0; m < size; m++) {
+                const b = f * size + m;
+                if (voidTiles[b]) continue;
+                const type = tiles[b], wallRaw = walls[b];
+                if (type === T.WALL || (wallRaw & 5) === 5 || (wallRaw & 10) === 10) {
+                    let vt = 0, kt = 0;
+                    for (let nt = -1; nt <= 1; nt++) {
+                        for (let st = -1; st <= 1; st++) {
+                            const St = m + st, Bt = f + nt;
+                            if (St < 0 || St >= size || Bt < 0 || Bt >= size) continue;
+                            const gt = Bt * size + St;
+                            const Yt = tiles[gt], Ft = walls[gt];
+                            if (Yt !== T.WALL && (Ft & 5) !== 5 && (Ft & 10) !== 10) {
+                                vt += heights[Bt * W + St];
+                                kt++;
+                            }
+                        }
+                    }
+                    const Mt = kt > 0 ? vt / kt : 0;
+                    heights[f * W + m] = Mt;
+                    heights[f * W + m + 1] = Mt;
+                    heights[(f + 1) * W + m] = Mt;
+                    heights[(f + 1) * W + m + 1] = Mt;
+                }
+            }
+        }
+
         // ── Pass 1: per-tile base colour (exactly mirrors the game's minimap logic) ──
         for (let f = 0; f < size; f++) {
             for (let m = 0; m < size; m++) {
@@ -1035,22 +1064,30 @@ export default class WorldMapPlugin extends Plugin {
                 let r = col[0], g = col[1], bl = col[2];
                 if (isWall) { r = clamp(r * 0.55); g = clamp(g * 0.55); bl = clamp(bl * 0.55); }
 
-                if (type !== T.WATER && type !== T.MUD) {
-                    // Coordinate-based noise (-3% to +3%)
-                    const noise = (((worldZ * 73856093 ^ worldX * 19349663) & 255) / 255) * 6 - 3;
+                if (type === T.WATER) {
+                    // Water gets a special, smaller noise frequency/amplitude
+                    const waterNoise = (((worldX * 3 * 73856093 ^ worldZ * 7 * 19349663) & 255) / 255) * 6 - 3;
+                    r = clamp(r + waterNoise * 0.5);
+                    g = clamp(g + waterNoise * 0.3);
+                    bl = clamp(bl + waterNoise * 0.2);
+                } else if (type !== T.MUD) {
+                    // Coordinate-based noise (-3 to +3)
+                    const noise = (((worldX * 73856093 ^ worldZ * 19349663) & 255) / 255) * 6 - 3;
                     
                     // Slope-based directional lighting
                     const ht = heights[f * W + m];
                     const pt = heights[f * W + m + 1];
                     const Ot = heights[(f + 1) * W + m];
-                    const ut = ht - pt;
-                    const vt = ht - Ot;
-                    const len = Math.sqrt(ut * ut + vt * vt + 1);
+                    // The game calculates slope as (x+1 - x) and (y+1 - y)
+                    const ut = pt - ht;
+                    const vt = Ot - ht;
                     
-                    const light = Math.max(0.2, Math.min(1.8, (ut * 0.6 + vt * 0.4 + 1) / len)) * (1 + noise / 100);
-                    r = clamp(r * light);
-                    g = clamp(g * light);
-                    bl = clamp(bl * light);
+                    // The vanilla game minimap uses a fast additive model, not multiplicative!
+                    const fi = (-ut * 0.7 - vt * 0.7) * 30;
+                    
+                    r = clamp(r + noise + fi);
+                    g = clamp(g + noise + fi);
+                    bl = clamp(bl + noise + fi);
                 }
 
                 const o = b * 4;
