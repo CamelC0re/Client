@@ -998,6 +998,17 @@ export default class WorldMapPlugin extends Plugin {
         const img = ctx.createImageData(size, size);
         const data = img.data;
 
+        // Fetch vertex heights for slope lighting
+        const W = size + 1;
+        const heights = new Float32Array(W * W);
+        if (typeof cm.getVertexHeight === 'function') {
+            for (let Z = 0; Z < W; Z++) {
+                for (let Q = 0; Q < W; Q++) {
+                    heights[Z * W + Q] = cm.getVertexHeight(startX + Q, startZ + Z);
+                }
+            }
+        }
+
         // ── Pass 1: per-tile base colour (exactly mirrors the game's minimap logic) ──
         for (let f = 0; f < size; f++) {
             for (let m = 0; m < size; m++) {
@@ -1023,6 +1034,25 @@ export default class WorldMapPlugin extends Plugin {
                 if (isRoof) col = ROOF;
                 let r = col[0], g = col[1], bl = col[2];
                 if (isWall) { r = clamp(r * 0.55); g = clamp(g * 0.55); bl = clamp(bl * 0.55); }
+
+                if (type !== T.WATER && type !== T.MUD) {
+                    // Coordinate-based noise (-3% to +3%)
+                    const noise = (((worldZ * 73856093 ^ worldX * 19349663) & 255) / 255) * 6 - 3;
+                    
+                    // Slope-based directional lighting
+                    const ht = heights[f * W + m];
+                    const pt = heights[f * W + m + 1];
+                    const Ot = heights[(f + 1) * W + m];
+                    const ut = ht - pt;
+                    const vt = ht - Ot;
+                    const len = Math.sqrt(ut * ut + vt * vt + 1);
+                    
+                    const light = Math.max(0.2, Math.min(1.8, (ut * 0.6 + vt * 0.4 + 1) / len)) * (1 + noise / 100);
+                    r = clamp(r * light);
+                    g = clamp(g * light);
+                    bl = clamp(bl * light);
+                }
+
                 const o = b * 4;
                 data[o] = r; data[o + 1] = g; data[o + 2] = bl; data[o + 3] = 255;
             }
@@ -1679,7 +1709,6 @@ export default class WorldMapPlugin extends Plugin {
     // ── Minimap marker layer ──────────────────────────────────────────────────────
     private drawMinimapMarkers(ctx: CanvasRenderingContext2D, dw: number, dh: number, srcLeft: number, srcTop: number, z: number) {
         const pad = 20;
-        const showLabels = z >= 4;
         for (const m of this.minimapMarkers) {
             const sx = (m.x + 0.5 - srcLeft) * z;
             const sy = (m.z + 0.5 - srcTop) * z;
