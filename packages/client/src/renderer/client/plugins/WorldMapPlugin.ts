@@ -1703,7 +1703,6 @@ export default class WorldMapPlugin extends Plugin {
 
             const hitRadius = (img && img.complete && img.naturalWidth > 0) ? u / 2 : 9;
             this.hitTargets.push({ sx, sy, r: hitRadius, label: m.label || m.icon || 'Marker', sub: `Minimap marker • ${m.x},${m.z}`, wx: m.x + 0.5, wz: m.z + 0.5 });
-            if (showLabels && m.label) this.drawLabel(ctx, m.label, sx, sy - (img && img.complete ? u / 2 + 6 : 11), m.color);
         }
     }
 
