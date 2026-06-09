@@ -1117,7 +1117,11 @@ export default class WorldMapPlugin extends Plugin {
         const srcLeft = this.centerX - dw / (2 * z);
         const srcTop = this.centerZ - dh / (2 * z);
 
-        ctx.imageSmoothingEnabled = false;
+        // The game's native minimap uses a custom Javascript bilinear interpolator to blend the
+        // calculated slope shading and coordinate noise across adjacent tiles. By enabling
+        // native hardware image smoothing here, the browser does the exact same bilinear
+        // filtering for us instantly when scaling the 1px-per-tile worldCanvas to the screen!
+        ctx.imageSmoothingEnabled = true;
         ctx.save();
         ctx.translate(-srcLeft * z, -srcTop * z);
         ctx.scale(z, z);
