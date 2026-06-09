@@ -55,10 +55,14 @@ import './modules/windowEventManagement';
 import { settingsService } from '../../modules/settingsManagement';
 import { registerDevLogin } from '../../devLogin';
 import { registerOAuthLogin, clearOAuthSession } from '../../oauthLogin';
+import { registerWorldMapCache } from '../../worldMapCache';
 
 // PRIMARY login: OAuth 2.0 Authorization Code + PKCE (the sanctioned EvilQuest path).
 // Silent refresh on launch; system-browser authorize only on first login.
 registerOAuthLogin();
+
+// World Map icon cache: load prebaked icons; accumulate generated ones (dev only).
+registerWorldMapCache();
 
 // FALLBACK (Ctrl+Shift+L): dev CDP relay — pops real Chrome, scrapes the session.
 // Kept only until OAuth is proven end-to-end, then removed.

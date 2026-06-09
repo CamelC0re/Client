@@ -75,6 +75,10 @@ body {
 }
 
 .highlite_titlebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
     height: var(--titlebar-height);
     min-height: var(--titlebar-height);
     max-height: var(--titlebar-height);
@@ -89,6 +93,8 @@ body {
     /* Electron allow user to drag the window */
     -webkit-app-region: drag;
     padding: 0 12px 0 5px;
+    /* Sit above game canvas so clicks on titlebar controls work */
+    z-index: 2147483646;
 }
 
 .highlite_titlebar #logoText {
