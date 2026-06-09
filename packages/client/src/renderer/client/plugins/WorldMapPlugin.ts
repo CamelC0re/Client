@@ -156,7 +156,98 @@ export default class WorldMapPlugin extends Plugin {
         this.info('World Map Plugin initializing.');
         this.settings.enable.value = true;
         this.loadFilterState();
+        this.setupChatHook();
         this.start();
+    }
+
+    private setupChatHook() {
+        const obs = new MutationObserver((mutations) => {
+            for (const m of mutations) {
+                if (m.type === 'childList') {
+                    for (const node of m.addedNodes) {
+                        if (node.nodeType === Node.ELEMENT_NODE) {
+                            const el = node as HTMLElement;
+                            // Make sure we only process elements within the chat-log
+                            if (el.closest && el.closest('#chat-log')) {
+                                this.processChatNode(el);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        obs.observe(document.body, { childList: true, subtree: true });
+        
+        // Also process any existing nodes in the chat log (in case we load late)
+        setTimeout(() => {
+            const chatLog = document.getElementById('chat-log');
+            if (chatLog) this.processChatNode(chatLog);
+        }, 1000);
+    }
+
+    private processChatNode(el: HTMLElement) {
+        // Find all deepest text nodes to prevent destroying HTML structure
+        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+        const textNodes: Text[] = [];
+        let currentNode: Node | null;
+        while ((currentNode = walker.nextNode())) {
+            textNodes.push(currentNode as Text);
+        }
+
+        const pattern = /\((-?\d+),\s*(-?\d+)\)(?:\[(.*?)\])?/g;
+
+        for (const node of textNodes) {
+            const text = node.nodeValue;
+            if (!text || !pattern.test(text)) continue;
+
+            const fragment = document.createDocumentFragment();
+            let lastIndex = 0;
+            pattern.lastIndex = 0; // Reset regex
+            
+            let match;
+            while ((match = pattern.exec(text)) !== null) {
+                // Add text before the match
+                if (match.index > lastIndex) {
+                    fragment.appendChild(document.createTextNode(text.substring(lastIndex, match.index)));
+                }
+
+                const x = parseInt(match[1], 10);
+                const z = parseInt(match[2], 10);
+                const label = match[3];
+
+                const link = document.createElement('span');
+                link.className = 'map-link';
+                link.textContent = label ? label : `(${x}, ${z})`;
+                link.title = label ? `Click to view (${x}, ${z}) on map` : 'Click to view on map';
+                Object.assign(link.style, {
+                    color: '#4da6ff',
+                    cursor: 'pointer',
+                    textDecoration: 'underline'
+                });
+
+                link.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    this.toggleMap(true);
+                    this.centerX = x;
+                    this.centerZ = z;
+                    this.followPlayer = false;
+                    this.zoom = 12; // Zoom in comfortably on the target
+                });
+
+                fragment.appendChild(link);
+                lastIndex = pattern.lastIndex;
+            }
+
+            // Add remaining text
+            if (lastIndex < text.length) {
+                fragment.appendChild(document.createTextNode(text.substring(lastIndex)));
+            }
+
+            if (node.parentNode) {
+                node.parentNode.replaceChild(fragment, node);
+            }
+        }
     }
 
     start() {
@@ -970,6 +1061,43 @@ export default class WorldMapPlugin extends Plugin {
                 if (this.gm?.minimap?.onClickMove) {
                     this.gm.minimap.onClickMove(worldX, worldZ, worldX, worldZ);
                 }
+            }
+        });
+
+        // Right-click -> Copy coordinate
+        canvas.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            if (!this.hoverPos) return;
+
+            const rect = canvas.getBoundingClientRect();
+            const z = this.zoom;
+            const dw = Math.max(1, Math.floor(rect.width));
+            const dh = Math.max(1, Math.floor(rect.height));
+            const srcLeft = this.centerX - dw / (2 * z);
+            const srcTop = this.centerZ - dh / (2 * z);
+            
+            const worldX = Math.round(srcLeft + this.hoverPos.x / z);
+            const worldZ = Math.round(srcTop + this.hoverPos.y / z);
+
+            let textToCopy = `(${worldX},${worldZ})`;
+            const hit = this.pickHit(this.hoverPos.x, this.hoverPos.y);
+            if (hit && hit.label) {
+                // Remove formatting or sub-labels, just take the raw name
+                const cleanLabel = hit.label.split('\n')[0].trim();
+                textToCopy += `[${cleanLabel}]`;
+            }
+
+            const chatInput = document.getElementById('chat-input') as HTMLInputElement;
+            if (chatInput) {
+                // If there's already text, append it with a space, otherwise just set it
+                const currentVal = chatInput.value.trim();
+                chatInput.value = currentVal ? `${currentVal} ${textToCopy}` : textToCopy;
+                chatInput.focus();
+                
+                // Optionally close the map so they can immediately hit enter or type
+                this.toggleMap(false);
+            } else {
+                this.setStatus('Chat input not found.');
             }
         });
     }
