@@ -54,9 +54,14 @@ import './modules/userPasswordManagement';
 import './modules/windowEventManagement';
 import { settingsService } from '../../modules/settingsManagement';
 import { registerDevLogin } from '../../devLogin';
+import { registerOAuthLogin, clearOAuthSession } from '../../oauthLogin';
 
-// DEV-ONLY: seamless browser-login session relay (Ctrl+Shift+L in the client).
-// Pops out real Chrome to log in past reCAPTCHA, captures the session, injects it.
+// PRIMARY login: OAuth 2.0 Authorization Code + PKCE (the sanctioned EvilQuest path).
+// Silent refresh on launch; system-browser authorize only on first login.
+registerOAuthLogin();
+
+// FALLBACK (Ctrl+Shift+L): dev CDP relay — pops real Chrome, scrapes the session.
+// Kept only until OAuth is proven end-to-end, then removed.
 registerDevLogin();
 
 app.commandLine.appendSwitch('disable-background-timer-throttling');
@@ -124,6 +129,13 @@ app.on("ready", async () => {
             const fullUrl = request.url;
             const isApi = url.pathname.startsWith('/api/') || url.pathname === '/play';
             const isAsset = url.pathname.startsWith('/assets/');
+
+            // In-game logout: drop our OAuth session so the silent auto-login on the
+            // following reload doesn't immediately log the user back in.
+            if (url.pathname === '/api/logout') {
+                console.log('[OAuth] /api/logout — clearing stored session');
+                clearOAuthSession();
+            }
 
             if (isAsset) {
                 console.log(`[Protocol-ASSET] ${request.method} ${fullUrl.slice(0, 120)}`);

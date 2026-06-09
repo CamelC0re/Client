@@ -53,6 +53,41 @@ document.body.insertBefore = function<T extends Node>(node: T, child: Node | nul
 // Load settings via centralized API (values are available via window.settings)
 await window.settings.getAll();
 
+// Honor the game's logout. EVERY logout path — the manual button, the server's 5-min
+// AFK kick, and session-expiry — clears localStorage.evilquest_token to return to the
+// login screen. Hook that removal and clear our OAuth session SYNCHRONOUSLY (sendSync,
+// no race) so the silent auto-login on the following reload can't bounce the user back
+// in and bypass the game's logout / AFK timer.
+const _eqRemoveItem = localStorage.removeItem.bind(localStorage);
+localStorage.removeItem = function (key: string) {
+    if (key === 'evilquest_token') {
+        try {
+            (window.electron.ipcRenderer as any).sendSync('oauth:logged-out');
+        } catch {
+            try { window.electron.ipcRenderer.send('oauth:logged-out'); } catch { /* ignore */ }
+        }
+    }
+    return _eqRemoveItem(key);
+};
+
+// PRIMARY login: OAuth 2.0 + PKCE. Try a silent refresh BEFORE the game loads so the
+// SPA authenticates on first paint (no reCAPTCHA, no reload). Sets the same localStorage
+// token the SPA validates on load; cookies are set in the main process during refresh.
+// Falls through to the login screen (+ "Log in with EvilQuest" button) on first run.
+try {
+    const auto = await window.electron.ipcRenderer.invoke('oauth:auto-login');
+    if (auto?.ok && auto.token) {
+        localStorage.setItem('evilquest_token', auto.token);
+        localStorage.setItem('evilquest_username', auto.username || '');
+        localStorage.setItem('evilquest_saved_username', auto.username || '');
+        console.log('[EvilLite] OAuth silent login ok (' + (auto.clientId || '') + ')');
+    } else {
+        console.log('[EvilLite] OAuth auto-login: ' + (auto?.reason || 'no session'));
+    }
+} catch (e) {
+    console.warn('[EvilLite] OAuth auto-login error', e);
+}
+
 async function obtainGameClient() {
     // For EvilQuest, the game scripts like babylon-core.js and GameManager.js are loaded
     // dynamically. We will need to set up interception for these scripts to apply Reflector hooks.
@@ -335,8 +370,81 @@ function devToast(msg: string, kind: 'info' | 'ok' | 'err' = 'info') {
     el.style.opacity = '1';
 }
 
+// PRIMARY login action: open the system browser via OAuth, then drop the returned
+// session token into localStorage and reload so the SPA logs in.
+async function oauthLogin() {
+    devToast('Opening your browser to log in with EvilQuest…');
+    try {
+        const r: any = await window.electron.ipcRenderer.invoke('oauth:login');
+        if (r?.ok && r.token) {
+            localStorage.setItem('evilquest_token', r.token);
+            localStorage.setItem('evilquest_username', r.username || '');
+            localStorage.setItem('evilquest_saved_username', r.username || '');
+            devToast('Logged in as ' + (r.username || '?') + ' — loading game…', 'ok');
+            document.getElementById('evillite-oauth-authorize')?.remove();
+            window.location.reload();
+        } else {
+            devToast('OAuth login failed: ' + (r?.error || 'unknown error'), 'err');
+        }
+    } catch (e) {
+        devToast('OAuth login error: ' + e, 'err');
+    }
+}
+
+// Transform the game's own login screen into the OAuth one: hide the native username/
+// password fields, remember/tabs/reCAPTCHA, and the submit button (manual login can't
+// pass reCAPTCHA from Electron), and reuse the native submit button itself — same menu
+// styling — as our "Authorize EvilQuest Login" button.
+function setupOAuthLoginScreen() {
+    const transform = () => {
+        const card = document.querySelector('.eq-login-card');
+        if (!card || card.querySelector('#evillite-oauth-authorize')) return;
+
+        // Hide the native login controls.
+        card.querySelectorAll('.eq-login-field, .eq-login-remember, .eq-login-tabs, .eq-login-recaptcha-notice, .eq-login-error')
+            .forEach((el) => ((el as HTMLElement).style.display = 'none'));
+
+        const submit = card.querySelector('#login-submit') as HTMLElement | null;
+        if (submit) {
+            // Reuse the native submit button (keeps the exact menu style); clone to strip
+            // its form-submit handler, retitle, and wire OAuth.
+            const ours = submit.cloneNode(true) as HTMLElement;
+            ours.id = 'evillite-oauth-authorize';
+            ours.setAttribute('type', 'button');
+            ours.textContent = 'Authorize EvilQuest Login';
+            (ours as any).disabled = false;
+            ours.style.display = '';
+            ours.addEventListener('click', (e) => { e.preventDefault(); void oauthLogin(); });
+            submit.parentElement?.replaceChild(ours, submit);
+        } else {
+            // Fallback if the submit button isn't found: a plain styled button.
+            const btn = document.createElement('button');
+            btn.id = 'evillite-oauth-authorize';
+            btn.className = 'eq-login-submit';
+            btn.type = 'button';
+            btn.textContent = 'Authorize EvilQuest Login';
+            btn.onclick = () => void oauthLogin();
+            card.appendChild(btn);
+        }
+    };
+    const obs = new MutationObserver(transform);
+    obs.observe(document.body, { childList: true, subtree: true });
+    transform();
+}
+
+// Always watch for the login screen — on first load OR after a logout / AFK kick (which
+// shows the login screen client-side, without a reload). When we're silently auto-logged
+// in the login screen never appears, so this stays a no-op.
+setupOAuthLoginScreen();
+
 // Emergency bypass for 'M' key testing while reCAPTCHA is blocked
 window.addEventListener('keydown', (e) => {
+    // 0. PRIMARY login: Ctrl+Shift+O — OAuth (system browser, sanctioned path).
+    if (e.ctrlKey && e.shiftKey && (e.key === 'o' || e.key === 'O')) {
+        e.preventDefault();
+        void oauthLogin();
+        return;
+    }
     // 1. Session Reset Hotkey: Ctrl+Shift+R
     if (e.ctrlKey && e.shiftKey && (e.key === 'r' || e.key === 'R')) {
         e.preventDefault();
