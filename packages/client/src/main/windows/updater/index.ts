@@ -42,7 +42,7 @@ async function configureAutoUpdater() {
 export async function createUpdateWindow() {
     await configureAutoUpdater();
     const updateWindow = new BrowserWindow({
-        title: 'Updating RyeLite...',
+        title: 'Updating EvilLite...',
         webPreferences: {
             preload: path.join(__dirname, '../preload/index.js'),
             sandbox: false, // Disable sandboxing for compatibility with some libraries

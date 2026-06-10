@@ -31,22 +31,23 @@
     "release": "electron-builder"
   },
   "build": {
-    "appId": "com.ryelite.desktop",
-    "copyright": "Copyright © 2025 RyeLite",
+    "appId": "net.evilquest.evillite",
+    "copyright": "Copyright © 2025 EvilLite",
     "asar": true,
     "files": [
       "out/**/*.*"
     ],
-    "productName": "RyeLite",
+    "productName": "EvilLite",
     "publish": [
       {
         "provider": "github",
-        "owner": "RyeL1te",
-        "repo": "RyeliteDesktop"
+        "owner": "atapifire",
+        "repo": "EvilLite"
       }
     ],
     "mac": {
       "category": "public.app-category.games",
+      "icon": "static/icons/icon.icns",
       "target": [
         {
           "target": "dmg",
@@ -66,7 +67,7 @@
           ]
         }
       ],
-      "icon": "build/icon.ico"
+      "icon": "static/icons/icon.ico"
     },
     "linux": {
       "target": [
@@ -78,18 +79,18 @@
           ]
         }
       ],
-      "icon": "build/icon.png"
+      "icon": "static/icons/icon.png"
     },
     "nsis": {
       "artifactName": "${productName}-Setup-${version}.${ext}",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
-      "installerIcon": "build/icon.ico",
-      "uninstallerIcon": "build/icon.ico",
-      "uninstallDisplayName": "RyeLite",
+      "installerIcon": "static/icons/icon.ico",
+      "uninstallerIcon": "static/icons/icon.ico",
+      "uninstallDisplayName": "EvilLite",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "RyeLite"
+      "shortcutName": "EvilLite"
     }
   },
   "dependencies": {
