@@ -50,6 +50,27 @@ document.body.insertBefore = function<T extends Node>(node: T, child: Node | nul
     return originalBodyInsertBefore(node, child);
 };
 
+// Auto-hide the titlebar (styled in client.html): reveal it only when the cursor is near
+// the top edge or over the bar; otherwise slide it away so the full-window game is never
+// covered. Window controls / drag stay accessible by moving to the very top.
+{
+    const REVEAL_Y = 6;
+    const HIDE_Y = 52;
+    let hideTimer: ReturnType<typeof setTimeout> | null = null;
+    const setHidden = (hidden: boolean) => document.querySelector('.highlite_titlebar')?.classList.toggle('eq-titlebar-hidden', hidden);
+    setHidden(true);
+    window.addEventListener('mousemove', (e) => {
+        const tb = document.querySelector('.highlite_titlebar') as HTMLElement | null;
+        const overBar = tb ? e.clientY <= tb.offsetHeight + 4 : false;
+        if (e.clientY <= REVEAL_Y || overBar) {
+            if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+            setHidden(false);
+        } else if (e.clientY > HIDE_Y && !hideTimer) {
+            hideTimer = setTimeout(() => { setHidden(true); hideTimer = null; }, 400);
+        }
+    }, { passive: true });
+}
+
 // Load settings via centralized API (values are available via window.settings)
 await window.settings.getAll();
 
@@ -350,6 +371,30 @@ document.dispatchEvent(
         cancelable: true,
     })
 );
+
+// Fix for mouse click offsets when the side-panel toggles
+// The game engine only listens to window resize, so when our client sidebar
+// resizes the #game-container, the canvas stretches and coordinates desync.
+// This forces the game engine to recalculate its resolution.
+const setupGameResizeObserver = () => {
+    const observer = new MutationObserver((mutations, obs) => {
+        const gameContainer = document.getElementById('game-container');
+        if (gameContainer) {
+            obs.disconnect(); // Only need to attach once
+            const resizeObserver = new ResizeObserver(() => {
+                const gm = (window as any).gm;
+                if (gm && typeof gm.handleViewportResize === 'function') {
+                    gm.handleViewportResize();
+                } else if (gm && gm.scene) {
+                    gm.scene.getEngine().resize();
+                }
+            });
+            resizeObserver.observe(gameContainer);
+        }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+};
+setupGameResizeObserver();
 
 // Lightweight on-screen toast for dev-login status (no copy-paste UI needed).
 function devToast(msg: string, kind: 'info' | 'ok' | 'err' = 'info') {

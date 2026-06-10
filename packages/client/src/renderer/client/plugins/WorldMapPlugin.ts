@@ -1522,6 +1522,11 @@ export default class WorldMapPlugin extends Plugin {
     private lastIconDiag = '';
     private offEngine: any = null;
     private offCanvas: HTMLCanvasElement | null = null;
+    // The offscreen Babylon engine accumulates GPU memory across GLB loads (textures/effects
+    // that scene.dispose() doesn't fully reclaim). Recycle it every N renders to bound RAM
+    // while STILL rendering every object (so the dev cache builds a complete map).
+    private rendersSinceEngineReset = 0;
+    private static readonly RENDERS_PER_ENGINE = 20;
 
     /**
      * Icon lookup order (cache-first, render-on-miss): in-memory → persisted
@@ -1868,6 +1873,16 @@ export default class WorldMapPlugin extends Plugin {
                 } finally {
                     this.iconPending.delete(key);
                 }
+                // Recycle the offscreen engine periodically to release accumulated GPU
+                // memory (this is what was OOM-killing us during a full render).
+                if (++this.rendersSinceEngineReset >= WorldMapPlugin.RENDERS_PER_ENGINE) {
+                    this.rendersSinceEngineReset = 0;
+                    try { this.offEngine?.dispose(); } catch { /* ignore */ }
+                    this.offEngine = null;
+                    this.offCanvas = null;
+                }
+                // Throttle so the queue doesn't burst-allocate and the GC keeps pace.
+                await new Promise((r) => setTimeout(r, 25));
             }
         } finally {
             this.iconRendering = false;
@@ -2000,7 +2015,17 @@ export default class WorldMapPlugin extends Plugin {
             }
             return best;
         } finally {
-            try { scene?.dispose(); } catch { /* ignore */ }
+            // Aggressively free GPU resources — textures especially are the big leak across
+            // many GLB loads; scene.dispose() alone leaves engine caches behind.
+            try {
+                if (scene) {
+                    for (const t of (scene.textures ?? []).slice()) { try { t.dispose(); } catch { /**/ } }
+                    for (const m of (scene.materials ?? []).slice()) { try { m.dispose(true, true); } catch { /**/ } }
+                    for (const g of (scene.geometries ?? []).slice()) { try { g.dispose(); } catch { /**/ } }
+                    for (const mesh of (scene.meshes ?? []).slice()) { try { mesh.dispose(false, true); } catch { /**/ } }
+                    scene.dispose();
+                }
+            } catch { /* ignore */ }
         }
     }
 
