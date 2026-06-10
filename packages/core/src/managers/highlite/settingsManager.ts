@@ -22,6 +22,7 @@ import type { HighliteSchema } from '../../interfaces/highlite/database/database
 import { type Plugin } from '../../interfaces/highlite/plugin/plugin.class';
 import { PluginSettings, SettingsTypes } from '../../interfaces/highlite/plugin/pluginSettings.interface';
 import type { PanelManager } from './panelManager';
+import { resolveUsername } from '../../utilities/resolveUsername';
 
 export class SettingsManager {
     private static instance: SettingsManager;
@@ -60,7 +61,7 @@ export class SettingsManager {
         this.pluginList = this.pluginList.map(plugin => plugin.instance).filter((instance): instance is Plugin => instance !== undefined);
 
         this.panelManager = document.highlite.managers.PanelManager;
-        this.username = document.highlite.gameHooks.EntityManager.Instance._mainPlayer._nameLowerCase;
+        this.username = resolveUsername();
         this.createMenu();
         this.isInitialized = true;
         return Promise.resolve();

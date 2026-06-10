@@ -59,3 +59,5 @@ export * from './reflector/types';
 export * from './utilities/abbreviateValue';
 export * from './utilities/lookupUtils';
 export * from './utilities/resources';
+export * from './utilities/pluginAssetCache';
+export * from './utilities/resolveUsername';

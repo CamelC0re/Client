@@ -55,14 +55,15 @@ import './modules/windowEventManagement';
 import { settingsService } from '../../modules/settingsManagement';
 import { registerDevLogin } from '../../devLogin';
 import { registerOAuthLogin, clearOAuthSession } from '../../oauthLogin';
-import { registerWorldMapCache } from '../../worldMapCache';
+import { registerPluginAssetCache } from '../../pluginAssetCache';
 
 // PRIMARY login: OAuth 2.0 Authorization Code + PKCE (the sanctioned EvilQuest path).
 // Silent refresh on launch; system-browser authorize only on first login.
 registerOAuthLogin();
 
-// World Map icon cache: load prebaked icons; accumulate generated ones (dev only).
-registerWorldMapCache();
+// Generic plugin asset cache: load prebaked assets; accumulate generated ones (dev
+// only), namespaced per plugin. The World Map uses it for its rendered model icons.
+registerPluginAssetCache();
 
 // FALLBACK (Ctrl+Shift+L): dev CDP relay — pops real Chrome, scrapes the session.
 // Kept only until OAuth is proven end-to-end, then removed.
@@ -74,7 +75,14 @@ app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
 
 app.on("ready", async () => {
-    await session.defaultSession.clearStorageData();
+    // NOTE: no blanket clearStorageData() here. It wiped cookies + localStorage +
+    // IndexedDB every launch, which destroyed plugin persistence (plugin.data,
+    // the World Map's stores) and the Reflector's saved hooks for no benefit —
+    // OAuth lives in a file (userData/evillite-oauth.json), not session storage,
+    // so login already survives restarts. reCAPTCHA-cookie freshness is now an
+    // opt-in setting (Settings → Login, default OFF) handled in createClientWindow,
+    // and it only touches Google's cookies. On-demand wipe is still available via
+    // the 'reset-captcha-session' IPC handler below.
 
     // Intercept ALL https requests so we can:
     //   1. Serve /__evillite__/* from local renderer files

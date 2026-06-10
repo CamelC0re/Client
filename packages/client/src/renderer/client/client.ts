@@ -144,37 +144,52 @@ async function obtainGameClient() {
         });
     };
 
-    // Start plugins as soon as any game module is up — fully decoupled from the
-    // Reflector so the client works even if hook-binding is delayed or fails.
-    const startPluginsOnce = () => {
-        if (!(window as any).highliteInstance) {
-            console.log('[EvilLite] highliteInstance NOT FOUND yet!');
-            return;
-        }
-        (window as any).highliteInstance.initialize();
-        if (!(window as any).highliteInstanceStarted) {
+    // Start the core + plugins via the canonical login sequence, ONCE, after the
+    // user is actually logged in. EvilQuest's socket class doesn't expose the
+    // method names core hooks for login (_loggedIn, etc.), so the normal
+    // SocketManager._loggedIn -> startHook() path never fires here. We drive it
+    // ourselves: register hooks (initialize), init the DB (start), then run
+    // startHook() — which resolves the username, populates each plugin's reactive
+    // plugin.data from IndexedDB (addPlugin), and runs initAll/postInitAll/startAll.
+    // Gating on a resolved username guarantees per-user data is keyed correctly and
+    // that plugin.data is loaded BEFORE plugins start reading it.
+    let coreInitDone = false;
+    let coreStarted = false;
+    const startPluginsOnce = async () => {
+        const hi = (window as any).highliteInstance;
+        if (!hi || (window as any).highliteInstanceStarted || (window as any).__eqPluginsStarting) return;
+
+        // Register hooks once (binds gameHooks methods + login/logout hooks).
+        if (!coreInitDone) { hi.initialize(); coreInitDone = true; }
+
+        // GameManager.Instance is captured by the HookManager on first hooked-method
+        // call; .username is set once the local player is in-world (i.e. logged in).
+        const username = document.highlite?.gameHooks?.GameManager?.Instance?.username;
+        if (!username) return; // not logged in yet — the login poller retries
+
+        (window as any).__eqPluginsStarting = true;
+        try {
+            console.log('[EvilLite] Login-ready (' + username + ') — starting core + plugins...');
+            // start() (DB init + plugin-hub bar icon) is NOT idempotent — only once.
+            if (!coreStarted) { await hi.start(); coreStarted = true; }
+            await hi.startHook('login');  // settings + plugin.data + initAll/postInitAll/startAll
             (window as any).highliteInstanceStarted = true;
-            console.log('[EvilLite] Starting plugins...');
-            (window as any).highliteInstance.pluginManager.setLoginState(true);
-            (window as any).highliteInstance.start().catch((e: any) => console.warn('[EvilLite] Core start error:', e));
-            (window as any).highliteInstance.pluginManager.initAll();
-            (window as any).highliteInstance.pluginManager.postInitAll();
-            (window as any).highliteInstance.pluginManager.startAll();
-            console.log('[EvilLite] Plugins started successfully!');
+            console.log('[EvilLite] Plugins started for ' + username);
+        } catch (e) {
+            console.warn('[EvilLite] Plugin start failed:', e);
+            (window as any).__eqPluginsStarting = false; // allow a later retry
         }
     };
 
-    // Poller: wait for the module set to settle (stable for ~1.2s) before
-    // parsing, so the full bundle set — GameManager, index, etc. — is present.
+    // Poller A: wait for the module set to settle (stable for ~1.2s), then parse +
+    // bind hooks once. Clears itself once hooks are bound.
     let lastCount = -1;
     let stableTicks = 0;
     const settleTimer = setInterval(() => {
         const modules = (window as any).__eqSourceModules;
         const count = Array.isArray(modules) ? modules.length : 0;
-        if (count > 0) startPluginsOnce();
         if (count === lastCount && count > 0) {
             stableTicks++;
-            // ~1.2s of no new modules → assume loading is done.
             if (stableTicks >= 4 && !(window as any).__eqHooksBound) {
                 console.log('[EvilLite] Module set settled at', count, 'modules — parsing.');
                 runReflectorParse();
@@ -186,10 +201,15 @@ async function obtainGameClient() {
         if ((window as any).__eqHooksBound) clearInterval(settleTimer);
     }, 300);
 
-    // Keep the legacy hook as a lightweight signal (kick the pollers immediately).
-    (window as any).onEqModuleLoaded = () => {
+    // Poller B: drive the login sequence. Runs until plugins have started (login can
+    // happen well after hooks bind, so this must outlive Poller A).
+    const loginTimer = setInterval(() => {
         startPluginsOnce();
-    };
+        if ((window as any).highliteInstanceStarted) clearInterval(loginTimer);
+    }, 500);
+
+    // Legacy signal: harmless nudge.
+    (window as any).onEqModuleLoaded = () => { startPluginsOnce(); };
     
     return Promise.resolve("");
 }
