@@ -81,3 +81,34 @@ jobs:
             packages/client/dist/*.dmg
             packages/client/dist/*.zip
             packages/client/dist/*.blockmap
+            packages/client/dist/*.yml
+
+  # On a v* tag, gather every platform's installers into one GitHub Release so testers
+  # have permanent public download links (and electron-updater has its latest*.yml feed).
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          draft: false
+          # Tags with a pre-release suffix (e.g. v0.2.0-beta.1) publish as pre-releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          body: |
+            Automated cross-platform build. **Unsigned** — testers will see OS warnings:
+            - Windows: SmartScreen → *More info* → *Run anyway*
+            - macOS: right-click the app → *Open* (or `xattr -dr com.apple.quarantine <app>`)
+
+            Linux AppImage (x64/arm64) · Windows installer (x64/arm64) · macOS dmg (x64/arm64).
