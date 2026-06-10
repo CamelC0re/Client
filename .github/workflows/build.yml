@@ -77,6 +77,8 @@ jobs:
           if-no-files-found: warn
           path: |
             packages/client/dist/*.AppImage
+            packages/client/dist/*.deb
+            packages/client/dist/*.tar.gz
             packages/client/dist/*.exe
             packages/client/dist/*.dmg
             packages/client/dist/*.zip
@@ -107,8 +109,16 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: false
           body: |
-            Automated cross-platform build. **Unsigned** — testers will see OS warnings:
-            - Windows: SmartScreen → *More info* → *Run anyway*
-            - macOS: right-click the app → *Open* (or `xattr -dr com.apple.quarantine <app>`)
+            Automated cross-platform build. **Unsigned**, so you'll see a one-time OS warning.
 
-            Linux AppImage (x64/arm64) · Windows installer (x64/arm64) · macOS dmg (x64/arm64).
+            ### Install
+            - **Windows** — `EvilLite-Setup-*.exe`. SmartScreen → *More info* → *Run anyway*.
+            - **macOS** — `*.dmg` (use `arm64` for Apple Silicon, the plain one for Intel).
+              Drag to Applications, then right-click the app → *Open* the first time
+              (or `xattr -dr com.apple.quarantine /Applications/EvilLite.app`).
+            - **Linux — easiest:** `*.deb` → `sudo apt install ./EvilLite-*.deb`, then launch
+              **EvilLite** from your apps menu. No flags, no extra packages.
+            - **Linux — portable:** `*.AppImage` or `*.tar.gz`. On modern distros these may need
+              `--no-sandbox` (and the AppImage needs `libfuse2`); the `.deb` avoids both.
+
+            `arm64` files are for ARM machines (Apple Silicon, ARM Linux); the others are x64/Intel.

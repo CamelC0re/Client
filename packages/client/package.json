@@ -73,14 +73,36 @@
     "linux": {
       "target": [
         {
+          "target": "deb",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
           "target": "AppImage",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "tar.gz",
           "arch": [
             "x64",
             "arm64"
           ]
         }
       ],
-      "icon": "static/icons/icon.png"
+      "icon": "static/icons/icon.png",
+      "category": "Game",
+      "synopsis": "Filterable world map and mod client for EvilQuest",
+      "desktop": {
+        "entry": {
+          "Name": "EvilLite",
+          "Categories": "Game;"
+        }
+      }
     },
     "nsis": {
       "artifactName": "${productName}-Setup-${version}.${ext}",
