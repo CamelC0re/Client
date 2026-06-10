@@ -30,9 +30,6 @@ export class Reflector {
     // Define the source
     private static source: string;
 
-    // Define the AST
-    private static ast: Node;
-
     // Define the classes
     private static classes: ClassInfo[] = [];
 
@@ -46,26 +43,47 @@ export class Reflector {
     private static enumHooks: HookMap = new Map();
 
     // Look the hooks from client source
+    // Backwards-compatible entry point — treats the input as a single module.
+    // Prefer loadHooksFromModules() for the real multi-bundle game source.
     static async loadHooksFromSource(source : string): Promise<void> {
+        return Reflector.loadHooksFromModules([source]);
+    }
 
-        // Bind the source
-        Reflector.source = source;
+    // Load the hooks from the per-module game source.
+    // The game ships as multiple minified ESM bundles that reuse top-level
+    // identifiers (e.g. `U`, `it`). Concatenating them into one
+    // sourceType:'module' parse makes acorn throw on the first duplicate
+    // declaration, which previously wiped out *every* hook. Parsing each module
+    // independently isolates failures and mirrors how the modules execute.
+    static async loadHooksFromModules(modules : string[]): Promise<void> {
 
-        // Bind the AST
-        Reflector.ast = parse(source, {
-            ecmaVersion: 'latest',
-            sourceType: 'module'
-        }) as unknown as Node;
+        // Combined source, used for textual `contains` checks via global offsets.
+        // Must match the '\n'-joined layout the offsets below assume.
+        Reflector.source = modules.join('\n');
 
         // Clear previous state for repeated parsing
         Reflector.classes = [];
         Reflector.enums = [];
 
-        // Bind the classes
-        Reflector.extractClasses();
+        // Parse each module in isolation, translating its node offsets into the
+        // combined-source coordinate space so `contains` slicing still works.
+        let offset = 0;
+        for (const moduleSource of modules) {
+            try {
+                const ast = parse(moduleSource, {
+                    ecmaVersion: 'latest',
+                    sourceType: 'module'
+                }) as unknown as Node;
 
-        // Bind the enums
-        Reflector.extractEnums();
+                Reflector.extractClasses(ast, offset);
+                Reflector.extractEnums(ast, offset);
+            } catch (e) {
+                console.warn('[Reflector] Skipping unparseable module:', (e as Error)?.message);
+            }
+
+            // +1 accounts for the '\n' inserted by modules.join('\n')
+            offset += moduleSource.length + 1;
+        }
 
         // Load the hooks
         Reflector.findHooksBySignature();
@@ -142,11 +160,12 @@ export class Reflector {
         return (classCount + enumCount) > 0;
     }
 
-    // Extract the classes from the AST
-    private static extractClasses() : ClassInfo[] {
+    // Extract the classes from a parsed module AST.
+    // `offset` shifts node positions into the combined-source coordinate space.
+    private static extractClasses(ast : Node, offset = 0) : ClassInfo[] {
 
         // Walk through the entire AST
-        walk.simple(Reflector.ast, {
+        walk.simple(ast, {
 
             // Handle class declarations
             ClassDeclaration(node : any) {
@@ -158,8 +177,8 @@ export class Reflector {
                     instanceFields: [],
                     staticMethods: [],
                     instanceMethods: [],
-                    start: node.start,
-                    end: node.end
+                    start: node.start + offset,
+                    end: node.end + offset
                 };
 
                 for (const m of node.body.body) {
@@ -183,11 +202,12 @@ export class Reflector {
         return Reflector.classes;
     }
 
-    // Extract the enums from the AST
-    private static extractEnums() : EnumInfo[] {
+    // Extract the enums from a parsed module AST.
+    // `offset` shifts node positions into the combined-source coordinate space.
+    private static extractEnums(ast : Node, offset = 0) : EnumInfo[] {
 
         // Walk through the entire AST
-        walk.simple(Reflector.ast, {
+        walk.simple(ast, {
 
             // Pattern 1: !function(e){ ... }(E || (E = {}));
             CallExpression(node: any) {
@@ -221,8 +241,8 @@ export class Reflector {
                 const e: EnumInfo = {
                     name: arg.left.name,
                     members: Array.from(memberSet),
-                    start: node.start,
-                    end: node.end
+                    start: node.start + offset,
+                    end: node.end + offset
                 };
 
                 Reflector.enums.push(e);

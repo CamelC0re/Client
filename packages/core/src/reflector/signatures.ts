@@ -23,6 +23,10 @@ import { ClassSignature, EnumSignature } from './types';
 export const ClassSignatures: [string, ClassSignature][] = [
 
     // Define all the class signatures
+    // GameManager is the top-level instance (window.gm). It is NOT a game-side singleton,
+    // so its live instance is captured by the HookManager on first hooked-method call and
+    // exposed as gameHooks.GameManager.Instance (see hookManager.registerClassHook).
+    ['GameManager', { methods: ['updateMinimap', 'showPlayerChatBubble', 'worldObjectDisplayName', 'waitForCurrentLocalPlayerReady'] }],
     ['EntityManager', { methods: ['CurrentOnlinePlayerCount', 'NPCs'] }],
     ['GroundItemManager', { methods: ['GroundItemCount'] }],
     ['MeshManager', { methods: ['getInstanceCountForMeshByFileName'] }],

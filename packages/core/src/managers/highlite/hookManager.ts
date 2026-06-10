@@ -114,6 +114,13 @@ export class HookManager {
         const hookName = `${sourceClass}_${functionName}`;
         (function (originalFunction: any) {
             classObject[fnName] = function (...args: Array<unknown>) {
+                // Capture the live instance for classes that aren't game-side singletons
+                // (e.g. GameManager exposes itself only via window.gm). Lets plugins read
+                // document.highlite.gameHooks.<Name>.Instance uniformly instead of reaching
+                // into raw globals. No-op for classes that already expose a static Instance.
+                if (targetClass.Instance === undefined) {
+                    try { targetClass.Instance = this; } catch { /* getter-only — leave it */ }
+                }
                 const originalReturn = originalFunction.apply(this, arguments);
                 hookFn.apply(self, [hookName, ...args, this]);
                 return originalReturn;

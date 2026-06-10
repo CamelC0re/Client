@@ -208,7 +208,13 @@ app.on("ready", async () => {
                 newHeaders.set('Access-Control-Allow-Origin', '*');
 
                 if (fullUrl.endsWith('.js') && response.status === 200) {
-                    // JS files: class exposure + URL rewriting
+                    // JS files: class exposure + URL rewriting.
+                    // Never cache: the Reflector needs every module to re-execute its
+                    // injected exposeCode on each load so __eqSourceModules is fully
+                    // populated (a cached module is served without re-running the push).
+                    newHeaders.set('Cache-Control', 'no-store, must-revalidate');
+                    newHeaders.delete('ETag');
+                    newHeaders.delete('Last-Modified');
                     let body = await response.text();
 
                     const classRegex = /\bclass\s+([A-Za-z0-9_]+)/g;
@@ -224,6 +230,12 @@ app.on("ready", async () => {
                     }
                     exposeCode += `if (!window.__eqSourceCode) window.__eqSourceCode = "";\n`;
                     exposeCode += `window.__eqSourceCode += ${JSON.stringify(body + "\n")};\n`;
+                    // Also keep each module body separately. Minified ESM bundles reuse
+                    // top-level identifiers, so the Reflector must parse them one-by-one
+                    // (concatenating them into a single module parse throws on the first
+                    // duplicate declaration and kills every hook).
+                    exposeCode += `if (!window.__eqSourceModules) window.__eqSourceModules = [];\n`;
+                    exposeCode += `window.__eqSourceModules.push(${JSON.stringify(body + "\n")});\n`;
                     exposeCode += `if (window.onEqModuleLoaded) window.onEqModuleLoaded();\n`;
                     body += exposeCode;
 

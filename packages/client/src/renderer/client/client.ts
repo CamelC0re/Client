@@ -114,60 +114,81 @@ async function obtainGameClient() {
     // dynamically. We will need to set up interception for these scripts to apply Reflector hooks.
     console.log('[EvilLite] Preparing game client interception...');
     
-    // We will hook into the module loaded event injected by our https:// protocol interceptor
-    (window as any).onEqModuleLoaded = async () => {
-        console.log('[EvilLite] onEqModuleLoaded triggered!');
-        if ((window as any).__eqSourceCode) {
-            console.log('[EvilLite] Source code found, length:', (window as any).__eqSourceCode.length);
-            
-            // Prevent multiple executions
-            if ((window as any).__eqIsParsing) return;
-            (window as any).__eqIsParsing = true;
-
-            try {
-                console.log('[EvilLite] Starting Reflector parse...');
-                // Run Reflector entirely in the background. Do not await it!
-                // Its internal IndexedDB saveHooks() call is deadlocking and hanging the thread.
-                Reflector.loadHooksFromSource((window as any).__eqSourceCode).then(() => {
-                    console.log('[EvilLite] Reflector finished parsing!');
-                    if ((document as any).highlite?.managers?.HookManager) {
-                        console.log('[EvilLite] HookManager found, binding hooks...');
-                        Reflector.bindClassHooks((document as any).highlite.managers.HookManager);
-                        Reflector.bindEnumHooks((document as any).highlite.managers.HookManager);
-                    }
-                }).catch(e => {
-                    console.warn('[EvilLite] Reflector threw an error (ignoring):', e);
-                });
-
-            } catch (err) {
-                console.error('[EvilLite] Reflector failed:', err);
-            } finally {
-                (window as any).__eqIsParsing = false;
+    // Parse the game source and bind hooks — exactly once, after all modules
+    // have loaded. The game ships several minified ESM bundles that load in
+    // dependency order; onEqModuleLoaded can fire unpredictably (or only once,
+    // for whichever module happens to finish after this handler is installed),
+    // so we DON'T parse on the callback directly. Instead a poller below waits
+    // for __eqSourceModules to stop growing, then parses the complete set.
+    const runReflectorParse = () => {
+        if ((window as any).__eqHooksBound || (window as any).__eqIsParsing) return;
+        const eqModules: string[] = (window as any).__eqSourceModules
+            ?? ((window as any).__eqSourceCode ? [(window as any).__eqSourceCode] : []);
+        if (!eqModules.length) return;
+        (window as any).__eqIsParsing = true;
+        console.log('[EvilLite] Reflector parsing', eqModules.length, 'module(s)...');
+        // Run in the background — its IndexedDB saveHooks() call can stall.
+        Reflector.loadHooksFromModules(eqModules).then(() => {
+            console.log('[EvilLite] Reflector finished parsing!');
+            const hm = (document as any).highlite?.managers?.HookManager;
+            if (hm && !(window as any).__eqHooksBound) {
+                (window as any).__eqHooksBound = true;
+                console.log('[EvilLite] HookManager found, binding hooks...');
+                Reflector.bindClassHooks(hm);
+                Reflector.bindEnumHooks(hm);
             }
+        }).catch(e => {
+            console.warn('[EvilLite] Reflector threw an error (ignoring):', e);
+        }).finally(() => {
+            (window as any).__eqIsParsing = false;
+        });
+    };
 
-            // COMPLETELY DECOUPLE PLUGIN START FROM REFLECTOR SUCCESS
-            if ((window as any).highliteInstance) {
-                console.log('[EvilLite] highliteInstance found, starting plugins...');
-                (window as any).highliteInstance.initialize();
-                if (!(window as any).highliteInstanceStarted) {
-                    (window as any).highliteInstanceStarted = true;
-                    (window as any).highliteInstance.pluginManager.setLoginState(true);
-                    
-                    // Run start in the background to prevent IndexedDB deadlocks from halting execution
-                    (window as any).highliteInstance.start().catch((e: any) => console.warn('[EvilLite] Core start error:', e));
-                    
-                    // Force start plugins here
-                    (window as any).highliteInstance.pluginManager.initAll();
-                    (window as any).highliteInstance.pluginManager.postInitAll();
-                    (window as any).highliteInstance.pluginManager.startAll();
-                    console.log('[EvilLite] Plugins started successfully!');
-                }
-            } else {
-                console.log('[EvilLite] highliteInstance NOT FOUND!');
+    // Start plugins as soon as any game module is up — fully decoupled from the
+    // Reflector so the client works even if hook-binding is delayed or fails.
+    const startPluginsOnce = () => {
+        if (!(window as any).highliteInstance) {
+            console.log('[EvilLite] highliteInstance NOT FOUND yet!');
+            return;
+        }
+        (window as any).highliteInstance.initialize();
+        if (!(window as any).highliteInstanceStarted) {
+            (window as any).highliteInstanceStarted = true;
+            console.log('[EvilLite] Starting plugins...');
+            (window as any).highliteInstance.pluginManager.setLoginState(true);
+            (window as any).highliteInstance.start().catch((e: any) => console.warn('[EvilLite] Core start error:', e));
+            (window as any).highliteInstance.pluginManager.initAll();
+            (window as any).highliteInstance.pluginManager.postInitAll();
+            (window as any).highliteInstance.pluginManager.startAll();
+            console.log('[EvilLite] Plugins started successfully!');
+        }
+    };
+
+    // Poller: wait for the module set to settle (stable for ~1.2s) before
+    // parsing, so the full bundle set — GameManager, index, etc. — is present.
+    let lastCount = -1;
+    let stableTicks = 0;
+    const settleTimer = setInterval(() => {
+        const modules = (window as any).__eqSourceModules;
+        const count = Array.isArray(modules) ? modules.length : 0;
+        if (count > 0) startPluginsOnce();
+        if (count === lastCount && count > 0) {
+            stableTicks++;
+            // ~1.2s of no new modules → assume loading is done.
+            if (stableTicks >= 4 && !(window as any).__eqHooksBound) {
+                console.log('[EvilLite] Module set settled at', count, 'modules — parsing.');
+                runReflectorParse();
             }
         } else {
-            console.log('[EvilLite] __eqSourceCode is empty or undefined!');
+            stableTicks = 0;
         }
+        lastCount = count;
+        if ((window as any).__eqHooksBound) clearInterval(settleTimer);
+    }, 300);
+
+    // Keep the legacy hook as a lightweight signal (kick the pollers immediately).
+    (window as any).onEqModuleLoaded = () => {
+        startPluginsOnce();
     };
     
     return Promise.resolve("");

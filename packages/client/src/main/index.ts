@@ -28,6 +28,12 @@ log.transports.file.level = 'debug';
 // Remove Electron's automation fingerprint so reCAPTCHA scores us as a real browser
 app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
 
+// Dev-only: expose CDP so we can inspect/drive the renderer (EQ_DEBUG=1).
+if (process.env.EQ_DEBUG === '1') {
+    app.commandLine.appendSwitch('remote-debugging-port', '9222');
+    app.commandLine.appendSwitch('remote-allow-origins', 'http://localhost:9222');
+}
+
 // Dev-only GPU enablement (EQ_GPU=1). On this dev box, launching through Xwayland
 // makes Chromium fall back to SwiftShader (software GL); native Wayland + the DRI
 // render node uses the real GPU (the recipe Google Chrome uses here). Shipped users
