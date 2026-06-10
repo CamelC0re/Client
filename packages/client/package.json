@@ -35,7 +35,14 @@
     "copyright": "Copyright © 2025 EvilLite",
     "asar": true,
     "files": [
-      "out/**/*.*"
+      "out/**/*.*",
+      "!**/node_modules/electron/**",
+      "!**/node_modules/electron-builder/**",
+      "!**/node_modules/app-builder-lib/**",
+      "!**/node_modules/electron-vite/**",
+      "!**/node_modules/@babylonjs/**",
+      "!**/node_modules/vite/**",
+      "!**/node_modules/typescript/**"
     ],
     "productName": "EvilLite",
     "publish": [
@@ -118,23 +125,24 @@
       "shortcutName": "EvilLite"
     }
   },
+  "//deps-note": "Only packages the MAIN/PRELOAD process loads at runtime (externalized by electron-vite) belong here — electron-builder copies production deps into the app. Everything the RENDERER uses is bundled by Vite, so it lives in devDependencies and must NOT be added here (notably @babylonjs/core: ~348MB, loaded at runtime via the import map/CDN, not node_modules).",
   "dependencies": {
-    "@babylonjs/core": "^8.28.1",
     "@electron-toolkit/preload": "^3.0.2",
     "@electron-toolkit/utils": "^4.0.0",
-    "@evillite/core": "workspace:*",
-    "@iconify/iconify": "^3.1.1",
     "electron-log": "^5.4.2",
-    "electron-updater": "^6.6.7",
-    "idb": "^8.0.3",
-    "interactjs": "^1.10.27"
+    "electron-updater": "^6.6.7"
   },
   "devDependencies": {
+    "@babylonjs/core": "^8.28.1",
     "@electron-toolkit/tsconfig": "^1.0.1",
+    "@evillite/core": "workspace:*",
+    "@iconify/iconify": "^3.1.1",
     "@types/node": "^22.17.1",
     "electron": "^37.2.6",
     "electron-builder": "^26.1.0",
     "electron-vite": "^4.0.0",
+    "idb": "^8.0.3",
+    "interactjs": "^1.10.27",
     "prettier": "^3.6.2",
     "ts-simple-nameof": "^1.3.3",
     "typescript": "^5.9.2",
