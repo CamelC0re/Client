@@ -1,0 +1,83 @@
+name: Build EvilLite (Linux / Windows / macOS)
+
+# Cross-platform builds happen on native runners — Windows installers need Windows
+# (or Wine), and macOS .dmg / universal / code-signing are macOS-only. A single Linux
+# box can only build Linux, so this matrix is how we produce all three.
+#
+# Run manually (Actions → this workflow → Run), or it runs on a v* tag. Artifacts are
+# attached to the run for testers to download; on a tag it also drafts a GitHub Release.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: windows-latest
+            platform: win
+          - os: macos-latest
+            platform: mac
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enable Corepack (Yarn 4)
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      # The World Map's prebaked icon cache lives in the plugin repo (it's gitignored
+      # here). Pull it in so packaged builds ship the icons instead of regenerating.
+      # Best-effort: the build still works without it.
+      - name: Fetch World Map prebaked asset cache
+        run: |
+          git clone --depth 1 https://github.com/atapifire/evillite-worldmap.git /tmp/wm || exit 0
+          mkdir -p packages/client/src/renderer/client/plugins/data
+          cp /tmp/wm/data/*.json packages/client/src/renderer/client/plugins/data/ 2>/dev/null || true
+
+      - name: Build core
+        run: yarn workspace @evillite/core build
+
+      - name: Build client (renderer + main + copy plugin cache)
+        run: yarn workspace @evillite/client build
+
+      - name: Package (${{ matrix.platform }})
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Build unsigned for tester handoff. Add signing creds + flip this on later.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          EV=$(node -p "require('electron/package.json').version")
+          echo "Packaging with electron $EV"
+          yarn workspace @evillite/client exec electron-builder \
+            --${{ matrix.platform }} -c.electronVersion="$EV" --publish never
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: evillite-${{ matrix.platform }}
+          if-no-files-found: warn
+          path: |
+            packages/client/dist/*.AppImage
+            packages/client/dist/*.exe
+            packages/client/dist/*.dmg
+            packages/client/dist/*.zip
+            packages/client/dist/*.blockmap
