@@ -96,7 +96,9 @@
       ],
       "icon": "static/icons/icon.png",
       "category": "Game",
+      "maintainer": "EvilLite <atapifire@users.noreply.github.com>",
       "synopsis": "Filterable world map and mod client for EvilQuest",
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
       "desktop": {
         "entry": {
           "Name": "EvilLite",
