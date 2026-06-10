@@ -63,11 +63,34 @@ export async function createUpdateWindow() {
         updateWindow.loadFile(path.join(__dirname, '../renderer/update.html'));
     }
 
+    // Proceed into the client exactly once. The update feed may be unconfigured,
+    // offline, or empty — in any of those cases we must NOT leave the user stuck on
+    // "Checking for updates…". Anything that means "we're not installing an update
+    // right now" routes through here.
+    let proceeded = false;
+    let updateCheckTimeout: ReturnType<typeof setTimeout> | null = null;
+    const clearUpdateTimeout = () => {
+        if (updateCheckTimeout) { clearTimeout(updateCheckTimeout); updateCheckTimeout = null; }
+    };
+    const proceedToClient = (reason: string) => {
+        if (proceeded) return;
+        proceeded = true;
+        clearUpdateTimeout();
+        log.info(`[Updater] proceeding to client: ${reason}`);
+        ipcMain.emit('no-update-available');
+    };
+
     updateWindow.on('ready-to-show', async () => {
         if (!app.isPackaged) {
             ipcMain.emit('delay-update');
         } else {
-            autoUpdater.checkForUpdates();
+            // Safety net: if the check neither resolves nor errors (e.g. the feed
+            // host hangs), proceed anyway after a grace period.
+            updateCheckTimeout = setTimeout(() => proceedToClient('update check timed out'), 15000);
+            autoUpdater.checkForUpdates().catch(err => {
+                log.error('[Updater] checkForUpdates rejected:', err);
+                proceedToClient('update check failed');
+            });
         }
     });
 
@@ -83,12 +106,20 @@ export async function createUpdateWindow() {
 
     autoUpdater.on('update-available', async updateInfo => {
         log.info('Update available:', updateInfo.releaseName);
+        // An update is pending the user's choice — don't auto-proceed on the timeout.
+        clearUpdateTimeout();
         updateWindow.webContents.send('update-available', updateInfo);
     });
 
     autoUpdater.on('update-not-available', async () => {
         log.info('Update not available');
-        ipcMain.emit('no-update-available');
+        proceedToClient('no update available');
+    });
+
+    // No feed configured / network failure / signature error — never hang.
+    autoUpdater.on('error', err => {
+        log.error('[Updater] error:', err);
+        proceedToClient('update check error');
     });
 
     ipcMain.once('install-update', async () => {

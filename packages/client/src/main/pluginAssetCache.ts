@@ -33,10 +33,27 @@ interface CacheShape {
     entries: Record<string, string>;
 }
 
-function cacheFile(namespace: string): string {
-    // Dev cwd = packages/client. Sanitise so a namespace can't escape the dir.
-    const safe = namespace.replace(/[^a-z0-9_-]/gi, '_');
-    return path.join(process.cwd(), 'src', 'renderer', 'client', 'plugins', 'data', `${safe}.json`);
+// Sanitise so a namespace can't escape the data dir.
+function safeName(namespace: string): string {
+    return namespace.replace(/[^a-z0-9_-]/gi, '_');
+}
+
+// Where the prebaked cache is READ from.
+//  - Packaged: bundled into the app at build time (see scripts/copy-plugin-data.mjs),
+//    read-only, resolved relative to the main bundle (out/main -> out/renderer/...).
+//  - Dev: the plugin source tree, so generated entries accumulate and can be committed.
+function readCacheFile(namespace: string): string {
+    const file = `${safeName(namespace)}.json`;
+    if (app.isPackaged) {
+        return path.join(__dirname, '..', 'renderer', 'plugins-data', file);
+    }
+    return path.join(process.cwd(), 'src', 'renderer', 'client', 'plugins', 'data', file);
+}
+
+// Where generated entries are WRITTEN (dev only — packaged builds never write). Always
+// the source tree so the committed cache grows as developers explore.
+function writeCacheFile(namespace: string): string {
+    return path.join(process.cwd(), 'src', 'renderer', 'client', 'plugins', 'data', `${safeName(namespace)}.json`);
 }
 
 const caches = new Map<string, CacheShape>();
@@ -48,7 +65,7 @@ function load(namespace: string): CacheShape {
     if (existing) return existing;
     let c: CacheShape;
     try {
-        const raw = JSON.parse(fs.readFileSync(cacheFile(namespace), 'utf8'));
+        const raw = JSON.parse(fs.readFileSync(readCacheFile(namespace), 'utf8'));
         // Back-compat: the original world-map cache stored the map under `icons`.
         const entries = raw && (raw.entries ?? raw.icons);
         c = raw && raw.__v === CACHE_VERSION && entries ? { __v: CACHE_VERSION, entries } : { __v: CACHE_VERSION, entries: {} };
@@ -64,9 +81,10 @@ function flush(namespace: string): void {
     if (!c || !dirty.has(namespace)) return;
     dirty.delete(namespace);
     try {
-        fs.mkdirSync(path.dirname(cacheFile(namespace)), { recursive: true });
-        fs.writeFileSync(cacheFile(namespace), JSON.stringify(c));
-        console.log(`[PluginAssetCache] wrote ${Object.keys(c.entries).length} entries → ${cacheFile(namespace)}`);
+        const file = writeCacheFile(namespace);
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, JSON.stringify(c));
+        console.log(`[PluginAssetCache] wrote ${Object.keys(c.entries).length} entries → ${file}`);
     } catch (e) {
         console.warn('[PluginAssetCache] write failed', e);
     }
