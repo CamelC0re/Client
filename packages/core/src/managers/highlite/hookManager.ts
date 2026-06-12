@@ -35,6 +35,12 @@ export class HookManager {
     }
 
     public registerClass(className: string, mappedName: string): boolean {
+        // Idempotent: if this class is already bound, skip. Re-binding would wrap its
+        // prototype methods a second time (hooks would fire twice). This lets the
+        // Reflector parse safely re-run to pick up classes that chunk-loaded late,
+        // without rewrapping anything already hooked.
+        if (document.highlite.gameHooks[mappedName]) return true;
+
         const classInstance = document.client.get(className);
 
         if (!classInstance) {

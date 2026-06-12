@@ -129,14 +129,19 @@ async function obtainGameClient() {
         console.log('[EvilLite] Reflector parsing', eqModules.length, 'module(s)...');
         // Run in the background — its IndexedDB saveHooks() call can stall.
         Reflector.loadHooksFromModules(eqModules).then(() => {
-            console.log('[EvilLite] Reflector finished parsing!');
             const hm = (document as any).highlite?.managers?.HookManager;
-            if (hm && !(window as any).__eqHooksBound) {
-                (window as any).__eqHooksBound = true;
-                console.log('[EvilLite] HookManager found, binding hooks...');
+            // bindClassHooks is idempotent (registerClass skips already-bound classes),
+            // so re-running on a later/fuller module set safely binds the stragglers.
+            if (hm) {
                 Reflector.bindClassHooks(hm);
                 Reflector.bindEnumHooks(hm);
             }
+            const bound = Object.keys((document as any).highlite?.gameHooks || {});
+            console.log('[EvilLite] Reflector bound:', bound.join(',') || '(none)');
+            // Only consider hooks "done" once GameManager (the critical one) is bound.
+            // EvilQuest can chunk-load the GameManager bundle AFTER the first settle, so
+            // if it's missing we leave this open and the poller re-parses with more modules.
+            if (bound.includes('GameManager')) (window as any).__eqHooksBound = true;
         }).catch(e => {
             console.warn('[EvilLite] Reflector threw an error (ignoring):', e);
         }).finally(() => {
@@ -162,9 +167,12 @@ async function obtainGameClient() {
         // Register hooks once (binds gameHooks methods + login/logout hooks).
         if (!coreInitDone) { hi.initialize(); coreInitDone = true; }
 
-        // GameManager.Instance is captured by the HookManager on first hooked-method
-        // call; .username is set once the local player is in-world (i.e. logged in).
-        const username = document.highlite?.gameHooks?.GameManager?.Instance?.username;
+        // Username = the user is logged in + in-world. Prefer the Reflector-captured
+        // GameManager.Instance, but fall back to the raw window.gm — the Reflector can
+        // flake (e.g. when EvilQuest ships a new bundle) and we must NOT let that stop the
+        // client from starting. window.gm.username is the reliable signal either way.
+        const username = document.highlite?.gameHooks?.GameManager?.Instance?.username
+            ?? (window as any).gm?.username;
         if (!username) return; // not logged in yet — the login poller retries
 
         (window as any).__eqPluginsStarting = true;
@@ -181,17 +189,23 @@ async function obtainGameClient() {
         }
     };
 
-    // Poller A: wait for the module set to settle (stable for ~1.2s), then parse +
-    // bind hooks once. Clears itself once hooks are bound.
+    // Poller A: parse + bind hooks once the module set has settled AND the game core is
+    // up. window.gm existing guarantees the GameManager bundle has executed and is in
+    // __eqSourceModules, so the parse can actually find it (the old "settle on a timer"
+    // raced and often parsed before GameManager chunk-loaded -> zero hooks bound).
+    // Re-parses whenever more modules have arrived since the last attempt, and only
+    // stops once GameManager is bound.
     let lastCount = -1;
     let stableTicks = 0;
+    let lastParsedCount = -1;
     const settleTimer = setInterval(() => {
         const modules = (window as any).__eqSourceModules;
         const count = Array.isArray(modules) ? modules.length : 0;
         if (count === lastCount && count > 0) {
             stableTicks++;
-            if (stableTicks >= 4 && !(window as any).__eqHooksBound) {
-                console.log('[EvilLite] Module set settled at', count, 'modules — parsing.');
+            if (stableTicks >= 3 && !(window as any).__eqHooksBound && (window as any).gm && count > lastParsedCount) {
+                lastParsedCount = count;
+                console.log('[EvilLite] Parsing at', count, 'modules (game core ready)...');
                 runReflectorParse();
             }
         } else {
