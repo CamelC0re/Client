@@ -44,12 +44,14 @@ jobs:
       - name: Install dependencies
         run: yarn install --immutable
 
-      # The World Map's prebaked icon cache lives in the plugin repo (it's gitignored
-      # here). Pull it in so packaged builds ship the icons instead of regenerating.
-      # Best-effort: the build still works without it.
-      - name: Fetch World Map prebaked asset cache
+      # The World Map plugin's source of truth is its own repo. Pull BOTH the plugin
+      # source and its prebaked icon cache from there so packaged builds bundle the
+      # current plugin (the copy tracked in this fork can lag) and ship the icons
+      # instead of regenerating them at runtime. Best-effort: build still works without.
+      - name: Sync World Map plugin + prebaked cache from the plugin repo
         run: |
           git clone --depth 1 https://github.com/atapifire/evillite-worldmap.git /tmp/wm || exit 0
+          cp /tmp/wm/src/WorldMapPlugin.ts packages/client/src/renderer/client/plugins/WorldMapPlugin.ts 2>/dev/null || true
           mkdir -p packages/client/src/renderer/client/plugins/data
           cp /tmp/wm/data/*.json packages/client/src/renderer/client/plugins/data/ 2>/dev/null || true
 
