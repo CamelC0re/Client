@@ -20,6 +20,7 @@ import { createConsoleWindow } from './windows/console';
 import { createClientWindow } from './windows/client';
 import log from 'electron-log';
 import registerScreenshotIPC from './modules/screenshotManagement/index';
+import { registerMapWindowIPC } from './windows/mapWindow/index';
 
 log.initialize({ spyRendererConsole: true });
 log.transports.console.level = 'info';
@@ -85,6 +86,7 @@ app.whenReady().then(async () => {
     });
 
     registerScreenshotIPC();
+    registerMapWindowIPC();
     ipcMain.once('delay-update', async () => {
         await createClientWindow();
         updateWindow.close();
