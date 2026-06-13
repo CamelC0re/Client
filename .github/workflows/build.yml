@@ -86,6 +86,10 @@ jobs:
             packages/client/dist/*.zip
             packages/client/dist/*.blockmap
             packages/client/dist/*.yml
+            # Every platform emits an identically-named builder-debug.yml; uploading all
+            # three collides on the same release asset name and fails the release job. It's
+            # an electron-builder debug dump testers don't need — exclude it.
+            !packages/client/dist/builder-debug.yml
 
   # On a v* tag, gather every platform's installers into one GitHub Release so testers
   # have permanent public download links (and electron-updater has its latest*.yml feed).
