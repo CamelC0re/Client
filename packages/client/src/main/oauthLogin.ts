@@ -55,19 +55,22 @@ function storeFile(): string {
 interface Store {
     device_id: string;
     refresh_token?: string;
+    // Epoch ms of the last time this session was known active (login / refresh / heartbeat).
+    // Silent auto-login is only allowed within AUTO_LOGIN_WINDOW_MS of this — see oauth:auto-login.
+    last_active?: number;
 }
 
 function readStore(): Store {
     try {
         const obj = JSON.parse(fs.readFileSync(storeFile(), 'utf8')) as {
-            device_id?: string; refresh_token?: string; refresh_token_enc?: string;
+            device_id?: string; refresh_token?: string; refresh_token_enc?: string; last_active?: number;
         };
         if (obj.device_id) {
             let refresh = obj.refresh_token;
             if (obj.refresh_token_enc && safeStorage.isEncryptionAvailable()) {
                 try { refresh = safeStorage.decryptString(Buffer.from(obj.refresh_token_enc, 'base64')); } catch { /* ignore */ }
             }
-            return { device_id: obj.device_id, refresh_token: refresh };
+            return { device_id: obj.device_id, refresh_token: refresh, last_active: obj.last_active };
         }
     } catch { /* missing / corrupt — fall through to fresh */ }
     const fresh: Store = { device_id: crypto.randomUUID() };
@@ -77,7 +80,8 @@ function readStore(): Store {
 
 function writeStore(s: Store): void {
     try {
-        const out: Record<string, string> = { device_id: s.device_id };
+        const out: Record<string, string | number> = { device_id: s.device_id };
+        if (typeof s.last_active === 'number') out.last_active = s.last_active;
         if (s.refresh_token) {
             if (safeStorage.isEncryptionAvailable()) {
                 out.refresh_token_enc = safeStorage.encryptString(s.refresh_token).toString('base64');
@@ -89,6 +93,18 @@ function writeStore(s: Store): void {
     } catch (e) {
         console.warn('[OAuth] writeStore failed', e);
     }
+}
+
+// The silent auto-login window. Mirrors EvilQuest's 5-minute in-game AFK logout: a
+// reload/reconnect within this window of the last activity silently re-logs in; a colder
+// start (first login of a session) must be a deliberate, manual login.
+const AUTO_LOGIN_WINDOW_MS = 5 * 60 * 1000;
+
+/** Record that the session is active right now (gates silent auto-login on next launch). */
+function touchActivity(): void {
+    const s = readStore();
+    s.last_active = Date.now();
+    writeStore(s);
 }
 
 function clearRefresh(): void {
@@ -240,11 +256,10 @@ type LoginResult = { ok: boolean; token?: string; username?: string; clientId?: 
 let sessionAccess: { token: string; username: string } | null = null;
 
 function persist(tok: TokenResult): void {
-    if (tok.refresh_token) {
-        const s = readStore();
-        s.refresh_token = tok.refresh_token; // rotates — store new, discard old
-        writeStore(s);
-    }
+    const s = readStore();
+    if (tok.refresh_token) s.refresh_token = tok.refresh_token; // rotates — store new, discard old
+    s.last_active = Date.now(); // a successful login/refresh counts as activity
+    writeStore(s);
     sessionAccess = { token: tok.access_token, username: tok.username || '' };
 }
 
@@ -289,6 +304,13 @@ export function registerOAuthLogin(): void {
         if (sessionAccess) return { ok: true, token: sessionAccess.token, username: sessionAccess.username, clientId: clientId() };
         const store = readStore();
         if (!store.refresh_token) return { ok: false, reason: 'no-refresh-token' };
+        // First login of a session is always manual: only silently re-login if the session
+        // was active within the last 5 minutes (a reload/reconnect, matching the AFK window).
+        const idle = store.last_active ? Date.now() - store.last_active : Infinity;
+        if (idle > AUTO_LOGIN_WINDOW_MS) {
+            console.log(`[OAuth] silent auto-login skipped — session idle ${Math.round(idle / 1000)}s (> ${AUTO_LOGIN_WINDOW_MS / 1000}s); manual login required`);
+            return { ok: false, reason: 'manual-login-required' };
+        }
         try {
             const tok = await tokenRequest({
                 grant_type: 'refresh_token',
@@ -309,6 +331,12 @@ export function registerOAuthLogin(): void {
         clearOAuthSession();
         return { ok: true };
     });
+
+    // The renderer pings this while the user is logged in + in-world, keeping last_active
+    // fresh so a reload/reopen within the 5-min window silently re-logs in. Once the pings
+    // stop (app closed, or AFK kick clears the session), a later cold start needs a manual
+    // login. Only counts while we actually hold a session.
+    ipcMain.on('oauth:heartbeat', () => { if (sessionAccess) touchActivity(); });
 
     ipcMain.handle('oauth:status', () => ({
         clientId: clientId(),

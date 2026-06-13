@@ -149,6 +149,16 @@ try {
     console.warn('[EvilLite] OAuth auto-login error', e);
 }
 
+// OAuth activity heartbeat: while the user is logged in + in-world, ping the main process
+// so it keeps the session "active". This is what lets a reload/reopen within 5 minutes
+// silently re-login (matching EvilQuest's AFK window); once these pings stop (app closed
+// or AFK-kicked), a later cold start requires a manual login — the first login of a
+// session is never silent. See oauth:heartbeat / oauth:auto-login in oauthLogin.ts.
+setInterval(() => {
+    const u = (document as any).highlite?.gameHooks?.GameManager?.Instance?.username ?? (window as any).gm?.username;
+    if (u) { try { window.electron.ipcRenderer.send('oauth:heartbeat'); } catch { /* ignore */ } }
+}, 60 * 1000);
+
 async function obtainGameClient() {
     // For EvilQuest, the game scripts like babylon-core.js and GameManager.js are loaded
     // dynamically. We will need to set up interception for these scripts to apply Reflector hooks.
