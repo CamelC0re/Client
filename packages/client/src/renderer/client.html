@@ -89,12 +89,28 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>. -->
                 transition: transform 0.2s ease;
             }
 
-            /* Auto-hide titlebar: the game fills the whole window (so clicks are accurate
-               and nothing is clipped); the titlebar overlays the top but slides away unless
-               the cursor is near the top edge or hovering it. */
+            /* ── Window layout ──────────────────────────────────────────────────────
+               Two modes, toggled by a body class (see layout.ts), driven by the
+               "Layout Mode" setting:
+                 • Reserve Space — titlebar (top) + plugin sidebar (right) take real
+                   layout room; the game shrinks to fit between them (RuneLite-style).
+                 • Overlay — the game fills the window (clicks unaffected) and the
+                   titlebar + sidebar float on top.                                    */
+            html, body { margin: 0; height: 100%; }
+            body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+            /* #main holds the game + the plugin sidebar (highlite_bar) as a flex row. */
+            #main {
+                position: relative;
+                display: flex;
+                flex-direction: row;
+                flex: 1 1 auto;
+                min-height: 0;
+                min-width: 0;
+            }
+            #game-wrapper { flex: 1 1 auto; min-width: 0; }
+
             .highlite_titlebar {
-                position: fixed;
-                top: 0;
                 left: 0;
                 right: 0;
                 z-index: 2147483646;
@@ -105,6 +121,22 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>. -->
                 opacity: 0;
                 pointer-events: none;
             }
+
+            /* Reserve Space: titlebar sits in normal flow (reserves its height); the
+               sidebar is a flex sibling of the game (reserves its width). */
+            body.eq-layout-reserve .highlite_titlebar { position: relative; flex: 0 0 auto; }
+            body.eq-layout-reserve.eq-titlebar-autohide .highlite_titlebar { position: fixed; top: 0; }
+
+            /* Overlay: titlebar + sidebar are fixed, floating over the full-window game. */
+            body.eq-layout-overlay .highlite_titlebar { position: fixed; top: 0; }
+            body.eq-layout-overlay .highlite_bar {
+                position: fixed; right: 0; bottom: 0; top: var(--titlebar-height);
+            }
+            body.eq-layout-overlay.eq-titlebar-autohide .highlite_bar { top: 0; }
+            body.eq-layout-overlay .highlite_bar_selected_content {
+                position: fixed; right: 30px; bottom: 0; top: var(--titlebar-height);
+            }
+            body.eq-layout-overlay.eq-titlebar-autohide .highlite_bar_selected_content { top: 0; }
         </style>
     </head>
     <body>
@@ -170,7 +202,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>. -->
             <source src="/media/login_screen.webm" type="video/webm"/>
         </video>
         -->
-        <div id="game-wrapper" style="width: 100%; height: 100vh; margin-top: 0; position: relative; overflow: hidden; transform: translate(0, 0);"></div>
+        <div id="game-wrapper" style="position: relative; overflow: hidden;"></div>
         <script type="module" src="client/client.ts"></script>
     </body>
 </html>

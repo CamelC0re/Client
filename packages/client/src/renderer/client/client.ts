@@ -30,6 +30,20 @@ import { setupWorldSelectorObserver } from './helpers/worldSelectHelper';
 // No fetch/XHR/createElement patching is needed for URL rewriting.
 
 
+// Window layout scaffold (titlebar + plugin sidebar). Built here — BEFORE the
+// body.appendChild patch below — so it uses the native appendChild. #main must exist
+// before PanelManager.setup() runs: the plugin sidebar (highlite_bar) is appended to
+// #main, so without it the sidebar is silently never created. game-wrapper lives inside
+// #main as a flex sibling of the sidebar. Layout *mode* (Reserve Space vs Overlay) +
+// titlebar auto-hide are applied from settings once they load (setupLayout(), below).
+document.body.classList.add('eq-layout-reserve');
+{
+    const gw = document.getElementById('game-wrapper');
+    let main = document.getElementById('main');
+    if (!main) { main = document.createElement('div'); main.id = 'main'; document.body.appendChild(main); }
+    if (gw && gw.parentElement !== main) main.appendChild(gw);
+}
+
 // Sandbox dynamically injected game UI elements into the game wrapper
 const originalBodyAppendChild = document.body.appendChild.bind(document.body);
 document.body.appendChild = function<T extends Node>(node: T): T {
@@ -50,17 +64,39 @@ document.body.insertBefore = function<T extends Node>(node: T, child: Node | nul
     return originalBodyInsertBefore(node, child);
 };
 
-// Auto-hide the titlebar (styled in client.html): reveal it only when the cursor is near
-// the top edge or over the bar; otherwise slide it away so the full-window game is never
-// covered. Window controls / drag stay accessible by moving to the very top.
-{
-    const REVEAL_Y = 6;
-    const HIDE_Y = 52;
+
+// Load settings via centralized API (values are available via window.settings)
+await window.settings.getAll();
+
+// Apply the window-layout settings now that they're loaded.
+await (async function setupLayout() {
+    const body = document.body;
+    const tbSel = () => document.querySelector('.highlite_titlebar') as HTMLElement | null;
+
+    const applyMode = (mode: string, autoHide: boolean) => {
+        const overlay = mode === 'Overlay';
+        body.classList.toggle('eq-layout-overlay', overlay);
+        body.classList.toggle('eq-layout-reserve', !overlay);
+        body.classList.toggle('eq-titlebar-autohide', autoHide);
+        // Static titlebar (auto-hide off) must never carry the hidden state.
+        tbSel()?.classList.toggle('eq-titlebar-hidden', autoHide);
+        // The game re-fits its canvas to the new container on resize.
+        window.dispatchEvent(new Event('resize'));
+    };
+
+    const mode = ((await window.settings.getByName('Layout Mode')) as string) || 'Reserve Space';
+    const autoHide = !!(await window.settings.getByName('Auto-hide Titlebar'));
+    applyMode(mode, autoHide);
+
+    // Auto-hide reveal: only acts while the titlebar is in auto-hide mode (gated by the
+    // body class), so a static titlebar is never yanked away by the cursor.
+    const REVEAL_Y = 8, HIDE_Y = 60;
     let hideTimer: ReturnType<typeof setTimeout> | null = null;
-    const setHidden = (hidden: boolean) => document.querySelector('.highlite_titlebar')?.classList.toggle('eq-titlebar-hidden', hidden);
-    setHidden(true);
+    const isAutoHide = () => body.classList.contains('eq-titlebar-autohide');
+    const setHidden = (h: boolean) => { if (isAutoHide()) tbSel()?.classList.toggle('eq-titlebar-hidden', h); };
     window.addEventListener('mousemove', (e) => {
-        const tb = document.querySelector('.highlite_titlebar') as HTMLElement | null;
+        if (!isAutoHide()) return;
+        const tb = tbSel();
         const overBar = tb ? e.clientY <= tb.offsetHeight + 4 : false;
         if (e.clientY <= REVEAL_Y || overBar) {
             if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
@@ -69,10 +105,14 @@ document.body.insertBefore = function<T extends Node>(node: T, child: Node | nul
             hideTimer = setTimeout(() => { setHidden(true); hideTimer = null; }, 400);
         }
     }, { passive: true });
-}
 
-// Load settings via centralized API (values are available via window.settings)
-await window.settings.getAll();
+    // Live-apply when the user saves settings (broadcast from settings:apply in main).
+    window.electron?.ipcRenderer?.on?.('settings:applied', async () => {
+        const m = ((await window.settings.getByName('Layout Mode')) as string) || 'Reserve Space';
+        const a = !!(await window.settings.getByName('Auto-hide Titlebar'));
+        applyMode(m, a);
+    });
+})();
 
 // Honor the game's logout. EVERY logout path — the manual button, the server's 5-min
 // AFK kick, and session-expiry — clears localStorage.evilquest_token to return to the
@@ -433,7 +473,7 @@ document.dispatchEvent(
 // This forces the game engine to recalculate its resolution.
 const setupGameResizeObserver = () => {
     const observer = new MutationObserver((mutations, obs) => {
-        const gameContainer = document.getElementById('game-container');
+        const gameContainer = document.getElementById('game-wrapper');
         if (gameContainer) {
             obs.disconnect(); // Only need to attach once
             const resizeObserver = new ResizeObserver(() => {

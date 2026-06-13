@@ -28,20 +28,22 @@ body {
     flex-direction: column !important;
 }
 
-#game-container {
+#game-wrapper {
     width: -webkit-fill-available !important;
     min-width: unset !important;
     border-right: 1px solid black !important;
 }
 
-#game-container .full-size {
-    width: -webkit-fill-available !important;
+#game-frame {
+    width: 100% !important;
     min-width: unset !important;
+    max-width: none !important;
 }
 
-#game-container__game-canvas {
-    width: -webkit-fill-available !important;
+#game-canvas {
+    width: 100% !important;
     min-width: unset !important;
+    max-width: none !important;
 }
 
 ::-webkit-scrollbar {

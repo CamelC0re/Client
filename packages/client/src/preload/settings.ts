@@ -104,6 +104,28 @@ export class settingsSchema extends SettingsSchema {
                 } as DropdownField
             ]
         },
+        Display: {
+            heading: "Display",
+            fields: [
+                {
+                    label: "Layout Mode",
+                    type: SettingTypes.DROPDOWN,
+                    description: "Reserve Space: the game shrinks to leave room for the titlebar (top) and plugin sidebar (right) — RuneLite-style. Overlay: the titlebar and sidebar float on top of the full-window game.",
+                    default: "Reserve Space",
+                    options: {
+                        "Reserve Space": "Reserve Space",
+                        "Overlay": "Overlay"
+                    },
+                    validation: (value) => ["Reserve Space", "Overlay"].includes(value as string),
+                } as DropdownField,
+                {
+                    label: "Auto-hide Titlebar",
+                    type: SettingTypes.BOOLEAN,
+                    description: "ON: the titlebar slides away until you move the cursor to the very top of the window. OFF (default): the titlebar stays visible.",
+                    default: false
+                } as Field
+            ]
+        },
         Plugins: {
             heading: "Plugin Settings",
             fields: [
