@@ -32,12 +32,26 @@ body {
     width: -webkit-fill-available !important;
     min-width: unset !important;
     border-right: 1px solid black !important;
+    /* Column flex so the game frame can fill the real available height (see #game-frame).
+       The frame is the only in-flow child; the game's other children (particles, panels,
+       login screen) are position:fixed overlays and are unaffected. */
+    display: flex !important;
+    flex-direction: column !important;
 }
 
 #game-frame {
     width: 100% !important;
     min-width: unset !important;
     max-width: none !important;
+    /* The game pins the frame to the full window height (min-height: 600px), but in
+       Reserve-Space mode the titlebar takes 28px, so the frame overflowed its container
+       and overflow:hidden clipped the game — top or bottom depending on whether the chat
+       input row was open. Make the frame a flex child that fills the container so its
+       internal grid reflows to the real available height instead of being clipped. */
+    flex: 1 1 auto !important;
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
 }
 
 #game-canvas {
