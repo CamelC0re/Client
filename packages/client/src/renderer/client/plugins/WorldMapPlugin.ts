@@ -1,5 +1,6 @@
 import { Plugin } from '@evillite/core/src/interfaces/highlite/plugin/plugin.class';
 import { SettingsTypes, type PluginSettings } from '@evillite/core/src/interfaces/highlite/plugin/pluginSettings.interface';
+import { PluginAssetCache } from '@evillite/core/src/utilities/pluginAssetCache';
 
 /**
  * World Map plugin for EvilQuest.
@@ -114,6 +115,7 @@ export default class WorldMapPlugin extends Plugin {
     private centerZ = 0;
     private zoom = 4;
     private followPlayer = true;
+    private followBtn: HTMLButtonElement | null = null;
     private currentFloor = 0;
 
     // ── Discovered/accumulated data ───────────────────────────────────────────────
@@ -145,6 +147,7 @@ export default class WorldMapPlugin extends Plugin {
     private hitTargets: HitTarget[] = [];
     private hoverPos: { x: number; y: number } | null = null;
     private floorLabelEl: HTMLSpanElement | null = null;
+    private floorControlsEl: HTMLDivElement | null = null;
 
     private static readonly NPC_CAT = '__npc__';
     private static readonly MAX_SIGHTINGS_PER_NPC = 240;
@@ -231,7 +234,7 @@ export default class WorldMapPlugin extends Plugin {
                     this.toggleMap(true);
                     this.centerX = x;
                     this.centerZ = z;
-                    this.followPlayer = false;
+                    this.setFollow(false);
                     this.zoom = 12; // Zoom in comfortably on the target
                 });
 
@@ -279,7 +282,10 @@ export default class WorldMapPlugin extends Plugin {
 
     // ── Game data access (all by stable semantic names) ───────────────────────────
     private get gm(): any {
-        return (window as any).gm ?? null;
+        // Route through the Reflector: the GameManager instance is captured into
+        // gameHooks.GameManager.Instance by the HookManager (it's not a game-side
+        // singleton). Fall back to the raw global only until hooks have bound.
+        return this.gameHooks?.GameManager?.Instance ?? (window as any).gm ?? null;
     }
     private getChunkManager(): any {
         return this.gm?.chunkManager ?? null;
@@ -565,35 +571,38 @@ export default class WorldMapPlugin extends Plugin {
         return '#ffd24a'; // default gold
     }
 
-    // ── Persistence (localStorage, per map) ───────────────────────────────────────
-    private storageKey(kind: string): string {
-        return `evilitemap:${kind}:${this.mapId}`;
+    // ── Persistence (core plugin.data → IndexedDB, per user) ──────────────────────
+    // plugin.data is a reactive object the core PluginDataManager auto-persists
+    // (debounced) to IndexedDB keyed by the logged-in user. Shape:
+    //   this.data.maps[mapId] = { obj: ObjRecord[], npc: { defId: {name, pts[]} } }
+    //   this.data.filters     = { disabledCats, disabledNames, show*, ... }
+    private ensureDataShape() {
+        if (!this.data.maps || typeof this.data.maps !== 'object') this.data.maps = {};
+        if (!this.data.filters || typeof this.data.filters !== 'object') this.data.filters = {};
     }
 
     private loadStores() {
         try {
-            const objRaw = localStorage.getItem(this.storageKey('obj'));
-            if (objRaw) {
-                const arr = JSON.parse(objRaw) as any[];
-                for (const o of arr) {
-                    const key = `${o.x},${o.z},${o.floor},${o.defId}`;
-                    this.objectStore.set(key, { defId: o.defId, category: o.category, name: o.name, x: o.x, z: o.z, floor: o.floor, depleted: false, assetId: o.assetId ?? '' });
-                }
+            this.ensureDataShape();
+            this.migrateLegacyLocalStorage();
+            const mapData = this.data.maps[this.mapId];
+            if (!mapData) return;
+            const arr = (mapData.obj ?? []) as any[];
+            for (const o of arr) {
+                const key = `${o.x},${o.z},${o.floor},${o.defId}`;
+                this.objectStore.set(key, { defId: o.defId, category: o.category, name: o.name, x: o.x, z: o.z, floor: o.floor, depleted: false, assetId: o.assetId ?? '' });
             }
-            const npcRaw = localStorage.getItem(this.storageKey('npc'));
-            if (npcRaw) {
-                const obj = JSON.parse(npcRaw) as Record<string, { name: string; pts: number[][] }>;
-                for (const defIdStr of Object.keys(obj)) {
-                    const defId = Number(defIdStr);
-                    const entry = obj[defIdStr];
-                    const m = new Map<string, NpcSighting>();
-                    for (const p of entry.pts) {
-                        const [x, z, level] = p;
-                        m.set(`${x},${z}`, { defId, name: entry.name, x, z, level: level < 0 ? undefined : level });
-                    }
-                    this.npcStore.set(defId, m);
-                    if (!this.npcNameDef.has(entry.name)) this.npcNameDef.set(entry.name, defId);
+            const npc = (mapData.npc ?? {}) as Record<string, { name: string; pts: number[][] }>;
+            for (const defIdStr of Object.keys(npc)) {
+                const defId = Number(defIdStr);
+                const entry = npc[defIdStr];
+                const m = new Map<string, NpcSighting>();
+                for (const p of entry.pts) {
+                    const [x, z, level] = p;
+                    m.set(`${x},${z}`, { defId, name: entry.name, x, z, level: level < 0 ? undefined : level });
                 }
+                this.npcStore.set(defId, m);
+                if (!this.npcNameDef.has(entry.name)) this.npcNameDef.set(entry.name, defId);
             }
         } catch (e: any) {
             this.warn('loadStores failed: ' + (e?.message || e));
@@ -606,15 +615,16 @@ export default class WorldMapPlugin extends Plugin {
         this.lastSave = performance.now();
         this.storeDirty = false;
         try {
+            this.ensureDataShape();
             const objArr = [...this.objectStore.values()].map((o) => ({ defId: o.defId, category: o.category, name: o.name, x: o.x, z: o.z, floor: o.floor, assetId: o.assetId }));
-            localStorage.setItem(this.storageKey('obj'), JSON.stringify(objArr));
 
             const npcObj: Record<string, { name: string; pts: number[][] }> = {};
             for (const [defId, m] of this.npcStore) {
                 const first = m.values().next().value;
                 npcObj[defId] = { name: first?.name ?? `NPC #${defId}`, pts: [...m.values()].map((s) => [s.x, s.z, s.level ?? -1]) };
             }
-            localStorage.setItem(this.storageKey('npc'), JSON.stringify(npcObj));
+            // Single assignment per map -> one reactive write (debounced by core).
+            this.data.maps[this.mapId] = { obj: objArr, npc: npcObj };
         } catch (e: any) {
             this.warn('persistStores failed: ' + (e?.message || e));
         }
@@ -622,9 +632,9 @@ export default class WorldMapPlugin extends Plugin {
 
     private loadFilterState() {
         try {
-            const raw = localStorage.getItem('evilitemap:filters');
-            if (!raw) return;
-            const f = JSON.parse(raw);
+            this.ensureDataShape();
+            const f = this.data.filters;
+            if (!f || !Object.keys(f).length) return;
             this.disabledCats = new Set(f.disabledCats ?? []);
             this.disabledNames = new Set(f.disabledNames ?? []);
             this.showLiveNpcs = f.showLiveNpcs ?? true;
@@ -637,7 +647,8 @@ export default class WorldMapPlugin extends Plugin {
     }
     private saveFilterState() {
         try {
-            localStorage.setItem('evilitemap:filters', JSON.stringify({
+            this.ensureDataShape();
+            this.data.filters = {
                 disabledCats: [...this.disabledCats],
                 disabledNames: [...this.disabledNames],
                 showLiveNpcs: this.showLiveNpcs,
@@ -646,7 +657,32 @@ export default class WorldMapPlugin extends Plugin {
                 iconsEnabled: this.iconsEnabled,
                 labelsEnabled: this.labelsEnabled,
                 showMinimapMarkers: this.showMinimapMarkers,
-            }));
+            };
+        } catch { /* ignore */ }
+    }
+
+    // One-time import of pre-plugin.data localStorage (`evilitemap:*`). Best-effort:
+    // the old launch-time clearStorageData() wiped this each boot, so there's at most
+    // one session to recover; once imported we drop the legacy keys.
+    private legacyMigrated = false;
+    private migrateLegacyLocalStorage() {
+        if (this.legacyMigrated) return;
+        this.legacyMigrated = true;
+        try {
+            const objRaw = localStorage.getItem(`evilitemap:obj:${this.mapId}`);
+            const npcRaw = localStorage.getItem(`evilitemap:npc:${this.mapId}`);
+            if ((objRaw || npcRaw) && !this.data.maps[this.mapId]) {
+                this.data.maps[this.mapId] = {
+                    obj: objRaw ? JSON.parse(objRaw) : [],
+                    npc: npcRaw ? JSON.parse(npcRaw) : {},
+                };
+            }
+            const filtRaw = localStorage.getItem('evilitemap:filters');
+            if (filtRaw && !Object.keys(this.data.filters).length) {
+                this.data.filters = JSON.parse(filtRaw);
+            }
+            for (const k of ['obj', 'npc']) localStorage.removeItem(`evilitemap:${k}:${this.mapId}`);
+            localStorage.removeItem('evilitemap:filters');
         } catch { /* ignore */ }
     }
 
@@ -687,7 +723,7 @@ export default class WorldMapPlugin extends Plugin {
     // ── Overlay UI ────────────────────────────────────────────────────────────────
     private updateFloorLabel() {
         if (this.floorLabelEl) {
-            this.floorLabelEl.innerText = `Floor: ${this.currentFloor}`;
+            this.floorLabelEl.innerText = `Floor ${this.currentFloor}`;
         }
     }
 
@@ -697,10 +733,20 @@ export default class WorldMapPlugin extends Plugin {
         this.mapOverlay = document.createElement('div');
         Object.assign(this.mapOverlay.style, {
             position: 'fixed', top: '6%', left: '6%', width: '88%', height: '88%',
-            backgroundColor: 'rgba(0,0,0,0.93)', border: '2px solid var(--theme-border, #444)',
+            // The container uses the game's own dark-stone tile (the same texture the vanilla
+            // UI panels/buttons use) instead of flat black, so the map window matches the
+            // rest of EvilQuest. A subtle dark overlay keeps the panel/header text readable.
+            // The tile is applied (rotated 90°) by applyContainerTexture once it loads.
+            backgroundColor: '#121212',
+            backgroundRepeat: 'repeat', backgroundSize: 'auto',
+            border: '2px solid var(--theme-border, #444)',
             borderRadius: '8px', zIndex: '2147483647', display: 'none', flexDirection: 'column',
             padding: '12px', boxSizing: 'border-box', fontFamily: 'Inter, sans-serif',
         } as CSSStyleDeclaration);
+        this.applyContainerTexture(this.mapOverlay);
+        // A freshly built overlay has an empty filter panel; clear the cached signature so
+        // the next refresh repopulates it (otherwise an unchanged dataset skips the rebuild).
+        this.panelSignature = '';
         this.mapOverlay.classList.add('highlite-ui');
 
         // Header
@@ -717,48 +763,68 @@ export default class WorldMapPlugin extends Plugin {
             flex: '1', maxWidth: '320px', padding: '6px 10px', borderRadius: '4px',
             border: '1px solid #555', background: '#1a1a1a', color: '#fff', fontSize: '13px',
         } as CSSStyleDeclaration);
-        this.searchInput.oninput = () => { this.searchStr = this.searchInput!.value.trim().toLowerCase(); };
-        this.searchInput.onkeydown = (e) => { if (e.key === 'Enter') this.jumpToNearestMatch(); e.stopPropagation(); };
-
         const jumpBtn = document.createElement('button');
         jumpBtn.innerText = 'Jump';
         this.styleButton(jumpBtn, '#2c3e50');
-        jumpBtn.title = 'Centre on the nearest search match';
+        jumpBtn.title = 'Centre on the nearest search match (or press Enter)';
         jumpBtn.onclick = () => this.jumpToNearestMatch();
+        // Jump only makes sense with a query — keep it disabled/dimmed until there's text.
+        const syncJump = () => { const on = !!this.searchStr; jumpBtn.disabled = !on; jumpBtn.style.opacity = on ? '1' : '0.4'; jumpBtn.style.cursor = on ? 'pointer' : 'default'; };
+        this.searchInput.oninput = () => { this.searchStr = this.searchInput!.value.trim().toLowerCase(); syncJump(); };
+        this.searchInput.onkeydown = (e) => { if (e.key === 'Enter') this.jumpToNearestMatch(); e.stopPropagation(); };
+        syncJump();
 
-        const followBtn = document.createElement('button');
-        followBtn.innerText = 'Follow: ON';
-        this.styleButton(followBtn, '#2c3e50');
-        const setFollow = (on: boolean) => {
-            this.followPlayer = on;
-            followBtn.innerText = `Follow: ${on ? 'ON' : 'OFF'}`;
-        };
-        followBtn.onclick = () => setFollow(!this.followPlayer);
+        this.followBtn = document.createElement('button');
+        this.styleButton(this.followBtn, '#27ae60');
+        this.followBtn.onclick = () => this.setFollow(!this.followPlayer);
+        this.setFollow(this.followPlayer); // sync text + colour to current state
 
         const closeBtn = document.createElement('button');
-        closeBtn.innerText = 'Close';
-        this.styleButton(closeBtn, 'var(--theme-danger, #e74c3c)');
+        closeBtn.innerText = '✕';
+        this.styleButton(closeBtn, 'transparent');
+        Object.assign(closeBtn.style, { padding: '4px 9px', fontSize: '16px', lineHeight: '1', color: '#ccc' } as CSSStyleDeclaration);
+        closeBtn.title = 'Close (M)';
+        closeBtn.onmouseenter = () => { closeBtn.style.color = '#fff'; closeBtn.style.backgroundColor = 'var(--theme-danger, #e74c3c)'; };
+        closeBtn.onmouseleave = () => { closeBtn.style.color = '#ccc'; closeBtn.style.backgroundColor = 'transparent'; };
         closeBtn.onclick = () => this.toggleMap(false);
 
+        // Compact floor stepper: ▾ [Floor n] ▴ grouped into one pill. Always visible so
+        // you can always see which floor you're on and step up/down between levels.
+        const styleFloorBtn = (b: HTMLButtonElement) => Object.assign(b.style, {
+            padding: '2px 7px', cursor: 'pointer', backgroundColor: 'transparent', border: 'none',
+            borderRadius: '4px', color: '#cfd6dc', fontSize: '12px', lineHeight: '1',
+        } as CSSStyleDeclaration);
+        const hoverFloorBtn = (b: HTMLButtonElement) => {
+            b.onmouseenter = () => { b.style.backgroundColor = '#3a4046'; };
+            b.onmouseleave = () => { b.style.backgroundColor = 'transparent'; };
+        };
+
         const floorDownBtn = document.createElement('button');
-        floorDownBtn.innerText = '▼';
-        this.styleButton(floorDownBtn, '#2c3e50');
-        floorDownBtn.title = 'Floor Down';
-        floorDownBtn.onclick = () => { setFollow(false); this.currentFloor--; this.worldCanvas = null; this.updateFloorLabel(); };
+        floorDownBtn.innerText = '▾';
+        styleFloorBtn(floorDownBtn); hoverFloorBtn(floorDownBtn);
+        floorDownBtn.title = 'Floor down';
+        floorDownBtn.onclick = () => { this.setFollow(false); this.currentFloor--; this.worldCanvas = null; this.updateFloorLabel(); };
 
         this.floorLabelEl = document.createElement('span');
-        this.updateFloorLabel();
-        Object.assign(this.floorLabelEl.style, { fontWeight: 'bold', minWidth: '60px', textAlign: 'center', userSelect: 'none' } as CSSStyleDeclaration);
+        Object.assign(this.floorLabelEl.style, { fontWeight: '600', minWidth: '50px', textAlign: 'center', userSelect: 'none', fontSize: '12px' } as CSSStyleDeclaration);
 
         const floorUpBtn = document.createElement('button');
-        floorUpBtn.innerText = '▲';
-        this.styleButton(floorUpBtn, '#2c3e50');
-        floorUpBtn.title = 'Floor Up';
-        floorUpBtn.onclick = () => { setFollow(false); this.currentFloor++; this.worldCanvas = null; this.updateFloorLabel(); };
+        floorUpBtn.innerText = '▴';
+        styleFloorBtn(floorUpBtn); hoverFloorBtn(floorUpBtn);
+        floorUpBtn.title = 'Floor up';
+        floorUpBtn.onclick = () => { this.setFollow(false); this.currentFloor++; this.worldCanvas = null; this.updateFloorLabel(); };
+
+        this.floorControlsEl = document.createElement('div');
+        Object.assign(this.floorControlsEl.style, {
+            display: 'flex', alignItems: 'center', gap: '1px',
+            background: 'rgba(0,0,0,0.28)', borderRadius: '6px', padding: '2px 3px',
+        } as CSSStyleDeclaration);
+        this.floorControlsEl.append(floorDownBtn, this.floorLabelEl, floorUpBtn);
+        this.updateFloorLabel(); // set initial label text
 
         const right = document.createElement('div');
         Object.assign(right.style, { display: 'flex', gap: '8px', alignItems: 'center' } as CSSStyleDeclaration);
-        right.append(floorDownBtn, this.floorLabelEl, floorUpBtn, followBtn, closeBtn);
+        right.append(this.floorControlsEl, this.followBtn, closeBtn);
         header.append(title, this.searchInput, jumpBtn, right);
 
         // Full-width status strip below the header (never truncated).
@@ -799,6 +865,32 @@ export default class WorldMapPlugin extends Plugin {
         document.body.appendChild(this.mapOverlay);
 
         this.installCanvasControls();
+    }
+
+    /** Apply the game's dark-stone tile to the map container, rotated 90° so the brick
+     *  courses run horizontally (matching the rest of the vanilla UI). CSS can't rotate a
+     *  background-image, so we pre-rotate the tile onto a canvas and use the data URL. The
+     *  texture is same-origin, so reading it back doesn't taint anything. */
+    private applyContainerTexture(el: HTMLElement) {
+        const overlay = 'linear-gradient(rgba(15,12,10,0.30), rgba(15,12,10,0.45))';
+        const url = 'https://evilquest.net/ui/stone-dark.png';
+        const img = new Image();
+        img.onload = () => {
+            try {
+                const w = img.naturalWidth, h = img.naturalHeight;
+                const c = document.createElement('canvas');
+                c.width = h; c.height = w; // swap dims for the 90° turn
+                const cx = c.getContext('2d')!;
+                cx.translate(c.width / 2, c.height / 2);
+                cx.rotate(Math.PI / 2);
+                cx.drawImage(img, -w / 2, -h / 2);
+                el.style.backgroundImage = `${overlay}, url("${c.toDataURL('image/png')}")`;
+            } catch {
+                el.style.backgroundImage = `${overlay}, url("${url}")`; // unrotated fallback
+            }
+        };
+        img.onerror = () => { el.style.backgroundImage = `${overlay}, url("${url}")`; };
+        img.src = url;
     }
 
     private styleButton(btn: HTMLButtonElement, bg: string) {
@@ -983,6 +1075,17 @@ export default class WorldMapPlugin extends Plugin {
             const t = e.target as HTMLElement | null;
             if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
             if (e.key === 'm' || e.key === 'M') this.toggleMap(this.mapOverlay?.style.display === 'none');
+            // DEV ONLY: Ctrl+Shift+B bakes the full icon cache. Gated to dev builds so it
+            // never fires for end users (in a packaged build the cache is read-only anyway).
+            if (e.ctrlKey && e.shiftKey && (e.key === 'B' || e.key === 'b') && (import.meta as any)?.env?.DEV) {
+                e.preventDefault();
+                void this.renderAllIcons();
+            }
+            // Export the full map to a standalone HTML (for the wiki/hub). Ctrl+Shift+E.
+            if (e.ctrlKey && e.shiftKey && (e.key === 'E' || e.key === 'e')) {
+                e.preventDefault();
+                void this.exportMap();
+            }
         }, { capture: true });
     }
 
@@ -1004,7 +1107,7 @@ export default class WorldMapPlugin extends Plugin {
         window.addEventListener('mousemove', (e) => {
             if (dragging) {
                 const dx = e.clientX - lastX, dy = e.clientY - lastY;
-                if (Math.abs(dx) + Math.abs(dy) > 2) { moved = true; this.followPlayer = false; }
+                if (Math.abs(dx) + Math.abs(dy) > 2) { moved = true; this.setFollow(false); }
                 lastX = e.clientX; lastY = e.clientY;
                 this.centerX -= dx / this.zoom;
                 this.centerZ -= dy / this.zoom;
@@ -1027,7 +1130,7 @@ export default class WorldMapPlugin extends Plugin {
                 
                 // Also update the UI button when we stop following
                 if (this.followPlayer) {
-                    this.followPlayer = false;
+                    this.setFollow(false);
                     const btn = this.mapOverlay?.querySelector('button') as HTMLButtonElement;
                     // The follow button is one of the buttons, we should ideally use the setFollow we created, but this works:
                     const followBtn = [...(this.mapOverlay?.querySelectorAll('button') ?? [])].find(b => b.innerText.startsWith('Follow:'));
@@ -1116,7 +1219,7 @@ export default class WorldMapPlugin extends Plugin {
         if (!this.mapOverlay) return;
         if (show) {
             this.mapOverlay.style.display = 'flex';
-            this.followPlayer = true;
+            this.setFollow(true);
             this.refreshData();
             this.startRenderLoop();
         } else {
@@ -1483,6 +1586,152 @@ export default class WorldMapPlugin extends Plugin {
         this.setStatus(`obj:${objCount} seen:${sightCount} live:${this.liveNpcs.length} z:${z.toFixed(1)}x${iconInfo}${diag}`);
     }
 
+    // ── Map export (for the wiki: standalone interactive HTML the Hub can host + iframe) ─
+    /**
+     * Export the explored map to a single self-contained HTML that MIRRORS the live map:
+     * the viewer re-renders terrain + icons at any zoom (sharp, not a baked image), with
+     * the same tile-grouping, icon sizing, category filters, POIs and search. Exports the
+     * DATA (terrain image + marker positions + icon images), not a flat PNG. Ctrl+Shift+E.
+     */
+    public async exportMap(): Promise<void> {
+        const cm = this.getChunkManager();
+        if (!cm) { this.warn('export: not in game'); return; }
+        if (!this.rebuildWorldCanvas(cm) || !this.worldCanvas) { this.warn('export: map data not loaded'); return; }
+        const W = this.worldW, H = this.worldH;
+        this.info(`export: gathering ${W}×${H} map data…`);
+
+        // Terrain as a 1px/tile PNG — the viewer scales it the same way the live map does.
+        const terrain = this.worldCanvas.toDataURL('image/png');
+
+        // Object icons (deduped) + one representative marker per tile (mirrors drawMarkers).
+        const iconIdx = new Map<string, number>();
+        const icons: string[] = [];
+        const idxOf = (im: HTMLImageElement | null): number => {
+            if (!im || !im.complete || !im.naturalWidth || !im.src.startsWith('data:')) return -1;
+            let i = iconIdx.get(im.src);
+            if (i === undefined) { i = icons.length; iconIdx.set(im.src, i); icons.push(im.src); }
+            return i;
+        };
+        const groups = new Map<string, MapObject[]>();
+        for (const o of this.objectStore.values()) {
+            if (o.floor !== undefined && o.floor !== this.currentFloor) continue;
+            const k = `${o.x},${o.z}`;
+            let arr = groups.get(k); if (!arr) { arr = []; groups.set(k, arr); } arr.push(o);
+        }
+        const catMap = new Map<string, { c: string; s: string }>();
+        const objects: any[] = [];
+        for (const group of groups.values()) {
+            let rep = group[0];
+            for (const g of group) { if (this.getObjectIcon(g)) rep = g; }
+            const o = rep;
+            if (!catMap.has(o.category)) catMap.set(o.category, { c: this.catColor(o.category), s: this.catShape(o.category) });
+            objects.push({ x: o.x, z: o.z, i: idxOf(this.getObjectIcon(o)), c: o.category, n: this.prettify(o.name), k: group.length, d: o.depleted ? 1 : 0 });
+        }
+        const cats = [...catMap.entries()].map(([n, v]) => ({ n, c: v.c, s: v.s })).sort((a, b) => a.n.localeCompare(b.n));
+
+        // POIs (minimap markers) + their icons, converted to data URLs so the file is self-contained.
+        const mmIdx = new Map<string, number>();
+        const mmIcons: string[] = [];
+        const toDataUrl = (im: HTMLImageElement): string | null => {
+            try { const c = document.createElement('canvas'); c.width = im.naturalWidth; c.height = im.naturalHeight; c.getContext('2d')!.drawImage(im, 0, 0); return c.toDataURL('image/png'); } catch { return null; }
+        };
+        const pois: any[] = [];
+        for (const m of this.minimapMarkers) {
+            let mi = -1;
+            const im = this.getMmIcon(m.icon);
+            if (im && im.complete && im.naturalWidth) {
+                const du = toDataUrl(im);
+                if (du) { let i = mmIdx.get(du); if (i === undefined) { i = mmIcons.length; mmIdx.set(du, i); mmIcons.push(du); } mi = i; }
+            }
+            pois.push({ x: m.x, z: m.z, n: (m.label || m.icon).replace(/\.(png|webp)$/i, '').replace(/_/g, ' '), m: mi, s: Math.max(8, Math.min(32, m.size || 16)) });
+        }
+
+        const data = { id: this.mapId || 'world', W, H, t: terrain, ic: icons, ob: objects, ct: cats, pi: pois, mm: mmIcons };
+        this.downloadFile(`evilquest-map-${this.mapId || 'world'}.html`, this.buildExportHtml(data));
+        this.info(`export: done — ${objects.length} markers, ${icons.length} icons, ${pois.length} POIs.`);
+    }
+
+    /** A self-contained interactive viewer that re-renders the exported data exactly like
+     *  the live World Map (terrain scaling, icon sizing, category filters, POIs, search). */
+    private buildExportHtml(data: any): string {
+        const json = JSON.stringify(data);
+        return '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
++ '<title>EvilQuest World Map - ' + data.id + '</title><style>'
++ 'html,body{margin:0;height:100%;background:#111;color:#eee;font:13px/1.4 Inter,system-ui,sans-serif;overflow:hidden}'
++ '#app{display:flex;height:100%}#side{width:220px;flex:none;background:#1b1b1b;border-right:1px solid #333;display:flex;flex-direction:column}'
++ '#side h1{font-size:14px;margin:0;padding:10px 12px;border-bottom:1px solid #333}#q{margin:8px;padding:6px 8px;border:1px solid #444;border-radius:4px;background:#111;color:#fff}'
++ '#layers{padding:6px 12px;border-bottom:1px solid #333}#layers label,#cats label{display:block;padding:3px 0;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}'
++ '#cats{overflow:auto;flex:1;padding:6px 10px}#cats .cat{margin-bottom:1px}'
++ '#cats .chead{display:flex;align-items:center;padding:3px 0}#cats .chead .cn{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:default}'
++ '#cats .exp{cursor:pointer;padding:0 5px;color:#9aa;user-select:none}#cats .subs{padding-left:20px}'
++ '#cats .sub{display:block;padding:2px 0;font-size:12px;color:#bbb;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}'
++ '#cats .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin:0 6px;vertical-align:middle}'
++ '#cats .ci{width:20px;height:20px;object-fit:contain;vertical-align:middle;margin:0 5px;flex:none}#cats .sub .ci{width:16px;height:16px}'
++ '#view{flex:1;position:relative;overflow:hidden;background:#0a0a0a;cursor:grab}#view.drag{cursor:grabbing}#c{position:absolute;inset:0}'
++ '#tip{position:absolute;background:#000d;border:1px solid #444;border-radius:4px;padding:4px 7px;font-size:12px;pointer-events:none;display:none;max-width:240px}'
++ '#hint{position:absolute;right:8px;bottom:8px;background:#000a;padding:4px 8px;border-radius:4px;font-size:11px;pointer-events:none}'
++ '</style></head><body><div id="app"><div id="side"><h1>World Map - ' + data.id + '</h1>'
++ '<input id="q" placeholder="Search..."><div id="layers"><label><input type="checkbox" id="L_ic" checked> Model icons</label>'
++ '<label><input type="checkbox" id="L_poi" checked> Minimap markers</label><label><input type="checkbox" id="L_lab"> Labels</label></div>'
++ '<div id="cats"></div></div><div id="view"><canvas id="c"></canvas><div id="tip"></div><div id="hint">drag to pan - scroll to zoom</div></div></div>'
++ '<script>(function(){var D=' + json + ';'
++ 'var view=document.getElementById("view"),cv=document.getElementById("c"),ctx=cv.getContext("2d"),tip=document.getElementById("tip"),q=document.getElementById("q");'
++ 'var terrain=new Image();terrain.src=D.t;var ICONS=D.ic.map(function(s){var i=new Image();i.src=s;return i;});var MM=D.mm.map(function(s){var i=new Image();i.src=s;return i;});'
++ 'var TAX={},nameOn={};D.ob.forEach(function(o){if(!TAX[o.c])TAX[o.c]={};TAX[o.c][o.n]=(TAX[o.c][o.n]||0)+o.k;});Object.keys(TAX).forEach(function(c){Object.keys(TAX[c]).forEach(function(n){nameOn[c+"|"+n]=true;});});var showIcons=true,showPoi=true,showLab=false;'
++ 'var cx=D.W/2,cz=D.H/2,Z=4,W=0,Hh=0,hits=[];'
++ 'function resize(){var r=view.getBoundingClientRect();W=cv.width=Math.floor(r.width);Hh=cv.height=Math.floor(r.height);render();}'
++ 'function clamp(v,a,b){return Math.max(a,Math.min(v,b));}'
++ 'function render(){if(!W)return;hits=[];ctx.fillStyle="#0a0a0a";ctx.fillRect(0,0,W,Hh);'
++ 'var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);'
++ 'if(terrain.complete&&terrain.naturalWidth){ctx.imageSmoothingEnabled=true;ctx.save();ctx.translate(-sl*Z,-st*Z);ctx.scale(Z,Z);ctx.drawImage(terrain,0,0);ctx.restore();}'
++ 'if(showIcons){for(var j=0;j<D.ob.length;j++){var o=D.ob[j];if(nameOn[o.c+"|"+o.n]===false)continue;var sx=(o.x+0.5-sl)*Z,sy=(o.z+0.5-st)*Z;if(sx<-30||sx>W+30||sy<-30||sy>Hh+30)continue;'
++ 'var hr;if(o.i>=0&&ICONS[o.i].complete&&ICONS[o.i].naturalWidth){var sz=clamp(Z*3,24,50);ctx.save();ctx.globalAlpha=o.d?0.45:1;ctx.shadowColor="rgba(0,0,0,.55)";ctx.shadowBlur=2;ctx.drawImage(ICONS[o.i],sx-sz/2,sy-sz/2,sz,sz);ctx.restore();hr=sz/2;}'
++ 'else{var col=(D.ct.filter(function(c){return c.n==o.c;})[0]||{c:"#ffd24a"}).c;var br=clamp(Z*0.55,3,9);ctx.fillStyle=col;ctx.globalAlpha=o.d?0.4:1;ctx.beginPath();ctx.arc(sx,sy,br,0,6.28);ctx.fill();ctx.globalAlpha=1;hr=br;}'
++ 'if(o.k>1){ctx.fillStyle="#c0392b";ctx.beginPath();ctx.arc(sx+hr*0.8,sy-hr*0.8,6,0,6.28);ctx.fill();ctx.fillStyle="#fff";ctx.font="9px sans-serif";ctx.textAlign="center";ctx.textBaseline="middle";ctx.fillText(o.k>9?"9+":""+o.k,sx+hr*0.8,sy-hr*0.8);}'
++ 'hits.push({sx:sx,sy:sy,r:hr,n:o.n+(o.k>1?" +"+(o.k-1):""),s:o.c+" - "+o.x+","+o.z});'
++ 'if(showLab){ctx.fillStyle="#fff";ctx.font="11px sans-serif";ctx.textAlign="center";ctx.textBaseline="bottom";ctx.shadowColor="#000";ctx.shadowBlur=3;ctx.fillText(o.n,sx,sy-hr-2);ctx.shadowBlur=0;}}}'
++ 'if(showPoi){for(var p=0;p<D.pi.length;p++){var P=D.pi[p];var px=(P.x+0.5-sl)*Z,py=(P.z+0.5-st)*Z;if(px<-30||px>W+30||py<-30||py>Hh+30)continue;var u=P.s;'
++ 'ctx.save();ctx.globalAlpha=0.7;ctx.fillStyle="rgba(0,0,0,.68)";ctx.beginPath();ctx.arc(px,py,u*0.55,0,6.28);ctx.fill();ctx.restore();'
++ 'if(P.m>=0&&MM[P.m].complete&&MM[P.m].naturalWidth)ctx.drawImage(MM[P.m],px-u/2,py-u/2,u,u);hits.push({sx:px,sy:py,r:u/2,n:P.n,s:P.x+","+P.z});}}}'
++ 'function fit(){var pad=10;Z=clamp(Math.min(W/(D.W+pad),Hh/(D.H+pad)),0.3,48);cx=D.W/2;cz=D.H/2;render();}'
++ 'var dragging=false,lx=0,ly=0,moved=false;'
++ 'view.addEventListener("mousedown",function(e){dragging=true;moved=false;lx=e.clientX;ly=e.clientY;view.classList.add("drag");});'
++ 'window.addEventListener("mouseup",function(){dragging=false;view.classList.remove("drag");});'
++ 'view.addEventListener("mousemove",function(e){if(dragging){var dx=e.clientX-lx,dy=e.clientY-ly;if(Math.abs(dx)+Math.abs(dy)>2)moved=true;cx-=dx/Z;cz-=dy/Z;lx=e.clientX;ly=e.clientY;render();tip.style.display="none";return;}'
++ 'var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top,best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}'
++ 'if(best){tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+10)+"px";tip.innerHTML="<b>"+best.n+"</b><br>"+best.s;}else tip.style.display="none";});'
++ 'view.addEventListener("wheel",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var f=e.deltaY<0?1.15:1/1.15;Z=clamp(Z*f,0.3,48);cx=wx+W/(2*Z)-mx/Z;cz=wz+Hh/(2*Z)-my/Z;render();},{passive:false});'
++ 'function goTo(x,z){Z=Math.max(Z,12);cx=x+0.5;cz=z+0.5;render();}'
++ 'function buildTax(){var box=document.getElementById("cats");box.innerHTML="";var esc=function(t){var d=document.createElement("span");d.textContent=t;return d.innerHTML;};'
++ 'var catIcon={},nameIcon={};D.ob.forEach(function(o){if(o.i>=0){if(catIcon[o.c]===undefined)catIcon[o.c]=o.i;if(nameIcon[o.c+"|"+o.n]===undefined)nameIcon[o.c+"|"+o.n]=o.i;}});'
++ 'var swatch=function(i,col){return i!==undefined?"<img class=ci src=\\""+D.ic[i]+"\\">":"<span class=sw style=background:"+col+"></span>";};'
++ 'Object.keys(TAX).sort().forEach(function(c){var col=(D.ct.filter(function(x){return x.n==c;})[0]||{c:"#ffd24a"}).c;var names=Object.keys(TAX[c]).sort();var tot=0;names.forEach(function(n){tot+=TAX[c][n];});'
++ 'var g=document.createElement("div");g.className="cat";var head=document.createElement("div");head.className="chead";'
++ 'head.innerHTML="<input type=checkbox class=cc checked>"+swatch(catIcon[c],col)+"<span class=cn>"+esc(c)+" ("+tot+")</span><span class=exp>\\u25b8</span>";'
++ 'var subs=document.createElement("div");subs.className="subs";subs.style.display="none";'
++ 'names.forEach(function(n){var l=document.createElement("label");l.className="sub";l.innerHTML="<input type=checkbox class=nc checked>"+swatch(nameIcon[c+"|"+n],col)+esc(n)+" ("+TAX[c][n]+")";'
++ 'var nb=l.querySelector("input");nb.onchange=function(){nameOn[c+"|"+n]=nb.checked;var any=names.some(function(x){return nameOn[c+"|"+x]!==false;});head.querySelector(".cc").checked=any;render();};subs.appendChild(l);});'
++ 'var cc=head.querySelector(".cc");cc.onchange=function(){var on=cc.checked;names.forEach(function(n){nameOn[c+"|"+n]=on;});subs.querySelectorAll(".nc").forEach(function(x){x.checked=on;});render();};'
++ 'head.querySelector(".exp").onclick=function(){var open=subs.style.display==="none";subs.style.display=open?"block":"none";this.textContent=open?"\\u25be":"\\u25b8";};'
++ 'g.appendChild(head);g.appendChild(subs);box.appendChild(g);});}'
++ 'document.getElementById("L_ic").onchange=function(e){showIcons=e.target.checked;render();};document.getElementById("L_poi").onchange=function(e){showPoi=e.target.checked;render();};document.getElementById("L_lab").onchange=function(e){showLab=e.target.checked;render();};'
++ 'q.oninput=function(){var s=q.value.trim().toLowerCase();if(!s)return;var best=null,bd=1e9;function consider(x,z,n){if(n.toLowerCase().indexOf(s)<0)return;var d=(x-cx)*(x-cx)+(z-cz)*(z-cz);if(d<bd){bd=d;best=[x,z];}}D.ob.forEach(function(o){consider(o.x,o.z,o.n+" "+o.c);});D.pi.forEach(function(P){consider(P.x,P.z,P.n);});if(best)goTo(best[0],best[1]);};'
++ 'buildTax();window.addEventListener("resize",resize);var ld=0;[terrain].concat(ICONS,MM).forEach(function(im){im.addEventListener("load",function(){if(++ld%40==0)render();});});setTimeout(render,400);setTimeout(render,1500);'
++ 'resize();fit();})();</script></body></html>';
+    }
+
+    /** Save text to a file via a download link (lands in the user's Downloads). */
+    private downloadFile(name: string, content: string) {
+        try {
+            const blob = new Blob([content], { type: 'text/html' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = name;
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 4000);
+        } catch (e: any) { this.warn('export download failed: ' + (e?.message || e)); }
+    }
+
     // ── Model-thumbnail icons (Phase 1) ───────────────────────────────────────────
     // Render the game's own 3D models to small sprites by reusing its already-loaded
     // Babylon instance (dynamically imported from the page's babylon-core module).
@@ -1491,6 +1740,9 @@ export default class WorldMapPlugin extends Plugin {
     // Icons render lazily on demand, are cached, and replace the colour/shape markers.
     private iconsEnabled = true;
     private iconCache = new Map<string, HTMLImageElement>();
+    /** Build-committed cache of rendered model icons, via the generic core asset
+     *  cache (main-process file under data/world-map-icons.json). */
+    private iconCacheStore = new PluginAssetCache('world-map-icons');
     private iconFailed = new Set<string>();
     private iconPending = new Set<string>();
     private iconQueue: { key: string; file: string }[] = [];
@@ -1573,8 +1825,7 @@ export default class WorldMapPlugin extends Plugin {
      *  been accumulating. Either way, cached icons skip the expensive runtime render. */
     private async loadPersistedIcons(): Promise<void> {
         try {
-            const icons: Record<string, string> | undefined =
-                await (window as any).electron?.ipcRenderer?.invoke('worldmap:load-icons');
+            const icons = await this.iconCacheStore.load();
             if (!icons) return;
             for (const key of Object.keys(icons)) {
                 const img = new Image();
@@ -1845,6 +2096,82 @@ export default class WorldMapPlugin extends Plugin {
     /** Hard cap on queued renders — prevents OOM when many objects become visible at once. */
     private static readonly MAX_ICON_QUEUE = 40;
 
+    /** True while renderAllIcons() is bulk-baking, so the queue's MAX_ICON_QUEUE trim
+     *  is suspended (we WANT to render everything, not just what's visible). */
+    private bulkRendering = false;
+
+    /**
+     * DEV TOOL: pre-render an icon for every model the def tables / asset registry
+     * currently know about, so the prebaked cache can be completed without walking the
+     * whole map. Trigger with Ctrl+Shift+B (dev builds only); also callable directly.
+     *
+     * Deliberately resilient and best-effort, because this WON'T hold forever:
+     *   - EvilQuest plans to lock assets behind auth — any model that 404s / 401s just
+     *     gets marked failed and skipped (per-model try/catch in processIconQueue), the
+     *     pass keeps going, and the normal explore-as-you-go rendering still works.
+     *   - It only bakes what the def/registry tables expose right now; if the game moves
+     *     to streaming defs (so exploration is required again), this simply bakes less,
+     *     and the on-demand path remains the source of truth.
+     * Saves are dev-only (the main-process cache is read-only in packaged builds), so
+     * running this in a shipped build renders in memory but writes nothing.
+     */
+    public async renderAllIcons(): Promise<void> {
+        if (this.bulkRendering) { this.info('render-all: already running'); return; }
+        if (this.bjsState !== 'ready') {
+            void this.initIconSystem();
+            this.warn('render-all: icon system not ready (need to be in-game) — try again in a moment');
+            return;
+        }
+        this.bulkRendering = true;
+        try {
+            // Dedupe (key -> model file); skip anything already cached/failed/pending.
+            const jobs = new Map<string, string>();
+            const add = (key: string, file: string | null | undefined) => {
+                if (!key || !file) return;
+                if (this.iconCache.has(key) || this.iconFailed.has(key) || this.iconPending.has(key) || jobs.has(key)) return;
+                jobs.set(key, file);
+            };
+
+            // 1) Objects keyed by assetId (the primary icon identity) from the asset registry.
+            const reg = this.getAssetRegistry();
+            if (reg && typeof (reg as any).forEach === 'function') {
+                (reg as any).forEach((entry: any, assetId: any) => {
+                    const path = entry?.path;
+                    if (typeof assetId === 'string' && typeof path === 'string' && /\.glb(\?|#|$)/i.test(path)) {
+                        add('obj:' + assetId, this.objAssetFile(assetId) ?? path);
+                    }
+                });
+            }
+            // 2) Objects keyed by defId (the fallback key, e.g. trees defined that way).
+            const objDefs: any = this.gm?.objectDefsCache;
+            if (objDefs && typeof objDefs.forEach === 'function') {
+                objDefs.forEach((def: any, defId: any) => add('objdef:' + defId, this.findGlb(def) ?? this.objModelFiles?.get(Number(defId)) ?? null));
+            }
+            this.objModelFiles?.forEach((file, defId) => add('objdef:' + defId, file));
+            // 3) NPCs keyed by defId (+ the shared humanoid base for model-less defs).
+            const npcDefs: any = this.gm?.entities?.npcDefsCache;
+            if (npcDefs && typeof npcDefs.forEach === 'function') {
+                npcDefs.forEach((_def: any, defId: any) => {
+                    const file = this.modelFileFor('npc', Number(defId));
+                    if (file) add('npc:' + defId, file);
+                    else add('npc:__humanoid__', WorldMapPlugin.HUMANOID_MODEL);
+                });
+            }
+            this.npcModelFiles?.forEach((file, defId) => add('npc:' + defId, file));
+
+            const total = jobs.size;
+            this.info(`render-all: queuing ${total} models (already have ${this.iconCache.size} cached, ${this.iconFailed.size} failed)`);
+            this.sendDiag(`RENDER-ALL queuing ${total} (cached=${this.iconCache.size} failed=${this.iconFailed.size})`);
+            if (!total) return;
+            for (const [key, file] of jobs) { this.iconPending.add(key); this.iconQueue.push({ key, file }); }
+            await this.processIconQueue();
+            this.info(`render-all: done — cache now ${this.iconCache.size}, failed ${this.iconFailed.size}`);
+            this.sendDiag(`RENDER-ALL done cache=${this.iconCache.size} failed=${this.iconFailed.size}`);
+        } finally {
+            this.bulkRendering = false;
+        }
+    }
+
     private async processIconQueue(): Promise<void> {
         if (this.iconRendering || !this.bjs) return;
         this.iconRendering = true;
@@ -1852,7 +2179,7 @@ export default class WorldMapPlugin extends Plugin {
             while (this.iconQueue.length) {
                 // Trim queue if it grew too large (new objects all visible at once on first load).
                 // Drop from the tail so the nearest/most-needed items (pushed first) render first.
-                if (this.iconQueue.length > WorldMapPlugin.MAX_ICON_QUEUE) {
+                if (!this.bulkRendering && this.iconQueue.length > WorldMapPlugin.MAX_ICON_QUEUE) {
                     const dropped = this.iconQueue.splice(WorldMapPlugin.MAX_ICON_QUEUE);
                     for (const d of dropped) this.iconPending.delete(d.key);
                 }
@@ -1863,8 +2190,9 @@ export default class WorldMapPlugin extends Plugin {
                         const img = new Image();
                         img.src = dataUrl;
                         this.iconCache.set(key, img);
-                        // Report to main so the dev cache accumulates this icon for the build.
-                        try { (window as any).electron?.ipcRenderer?.send('worldmap:save-icon', key, dataUrl); } catch { /* ignore */ }
+                        // Report to the generic asset cache so the dev cache accumulates
+                        // this icon for the build (no-op in packaged builds).
+                        this.iconCacheStore.save(key, dataUrl);
                     } else this.iconFailed.add(key);
                 } catch (e: any) {
                     this.iconFailed.add(key);
@@ -2397,6 +2725,19 @@ export default class WorldMapPlugin extends Plugin {
         this.tooltipEl.innerHTML = `<b>${hit.label}</b><br><span style="opacity:0.75">${hit.sub}</span>`;
     }
 
+    /** Single source of truth for follow state — keeps this.followPlayer and the header
+     *  button (text + colour) in sync. EVERYTHING that changes follow must call this
+     *  (drag, jump, floor change, recentre all used to set the flag directly and leave
+     *  the button showing the wrong state). */
+    private setFollow(on: boolean) {
+        this.followPlayer = on;
+        const b = this.followBtn;
+        if (!b) return;
+        b.innerText = on ? '◉ Follow' : '○ Follow';
+        b.style.backgroundColor = on ? '#27ae60' : '#3a3f44';
+        b.title = on ? 'Following you — click to free the camera' : 'Free camera — click to follow you';
+    }
+
     private jumpToNearestMatch() {
         const q = this.searchStr;
         if (!q) return;
@@ -2419,7 +2760,7 @@ export default class WorldMapPlugin extends Plugin {
         if (best) {
             this.centerX = (best as { x: number; z: number }).x;
             this.centerZ = (best as { x: number; z: number }).z;
-            this.followPlayer = false;
+            this.setFollow(false);
             this.zoom = Math.max(this.zoom, 10);
         }
     }
