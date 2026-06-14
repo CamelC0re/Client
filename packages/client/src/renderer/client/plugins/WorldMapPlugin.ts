@@ -134,6 +134,15 @@ export default class WorldMapPlugin extends Plugin {
     private mapWindowFullTimer: any = null;
     private mwCloseHooked = false;
 
+    // ── One viewer, two hosts ─────────────────────────────────────────────────────
+    // The SAME HTML viewer (buildMapWindowHtml) runs either in a detached OS window
+    // ('window') or an in-page iframe docked over the game ('overlay'). mapMode is the
+    // user's remembered preference; the active host is whichever is currently open.
+    private mapMode: 'window' | 'overlay' = 'window';
+    private overlayEl: HTMLDivElement | null = null;   // iframe container (overlay host)
+    private overlayFrame: HTMLIFrameElement | null = null;
+    private overlayMsgHooked = false;
+
     // ── View state (tile units) ───────────────────────────────────────────────────
     private centerX = 0;
     private centerZ = 0;
@@ -280,21 +289,9 @@ export default class WorldMapPlugin extends Plugin {
                 link.addEventListener('click', (e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    const usePopout = this.settings.popoutMode?.value !== false;
-
-                    if (usePopout) {
-                        this.openMapWindow();
-                        const ipc = (window as any).electron?.ipcRenderer;
-                        if (ipc) {
-                            ipc.send('map-window:update', { goTo: { x, z } });
-                        }
-                    } else {
-                        this.toggleMap(true);
-                        this.centerX = x;
-                        this.centerZ = z;
-                        this.setFollow(false);
-                        this.zoom = 12; // Zoom in comfortably on the target
-                    }
+                    // Open the map (in the user's remembered host) and jump to the coordinate.
+                    this.openMap();
+                    setTimeout(() => this.pushToViewer({ goTo: { x, z } }), 60);
                 });
 
                 fragment.appendChild(link);
@@ -887,6 +884,7 @@ export default class WorldMapPlugin extends Plugin {
             this.iconsEnabled = f.iconsEnabled ?? true;
             this.labelsEnabled = f.labelsEnabled ?? true;
             this.showMinimapMarkers = f.showMinimapMarkers ?? true;
+            this.mapMode = f.mapMode === 'overlay' ? 'overlay' : 'window';
         } catch { /* ignore */ }
     }
     private saveFilterState() {
@@ -901,6 +899,7 @@ export default class WorldMapPlugin extends Plugin {
                 iconsEnabled: this.iconsEnabled,
                 labelsEnabled: this.labelsEnabled,
                 showMinimapMarkers: this.showMinimapMarkers,
+                mapMode: this.mapMode,
             };
         } catch { /* ignore */ }
     }
@@ -2178,24 +2177,88 @@ export default class WorldMapPlugin extends Plugin {
      *  playing the game underneath). The window runs the same interactive viewer as the
      *  HTML export; the game renderer streams it live data (player position frequently, a
      *  full snapshot occasionally) over IPC. */
-    public openMapWindow(): void {
+    /** Entry point (sidebar icon / M-key): open the map in the user's remembered mode. */
+    public openMap(): void {
+        if (this.mapMode === 'overlay') this.openOverlayHost();
+        else this.openWindowHost();
+    }
+    /** Back-compat alias (chat-link handoff, older call sites). */
+    public openMapWindow(): void { this.openMap(); }
+
+    /** Host A — detached OS window (IPC transport). */
+    private openWindowHost(): void {
         const ipc = (window as any).electron?.ipcRenderer;
         if (!ipc?.send) { this.warn('map window: IPC unavailable'); return; }
         if (this.mapWindowOpen) { ipc.send('map-window:focus'); return; }
-        // Make sure data is current before the first snapshot.
         this.refreshData();
         const snap = this.buildMapSnapshot();
-        if (!snap) { this.warn('map window: data not ready (log in / move around first)'); return; }
-        ipc.send('map-window:open', this.buildMapWindowHtml(snap));
+        if (!snap) { this.warn('map: data not ready (log in / move around first)'); return; }
+        ipc.send('map-window:open', this.buildMapWindowHtml(snap, 'window'));
         this.mapWindowOpen = true;
         if (!this.mwCloseHooked) {
             this.mwCloseHooked = true;
-            ipc.on?.('map-window:closed', () => { this.mapWindowOpen = false; this.stopMapWindowUpdates(); });
-            // Forwarded input from the detached window (click-to-move, floor change).
+            ipc.on?.('map-window:closed', () => { this.mapWindowOpen = false; if (!this.overlayEl) this.stopMapWindowUpdates(); });
             ipc.on?.('map-window:input', (_e: any, msg: any) => this.handleMapWindowInput(msg));
         }
         this.startMapWindowUpdates();
-        this.info('map window opened.');
+        this.info('map opened (window).');
+    }
+
+    /** Host B — in-page iframe docked over the game (postMessage transport). Same viewer. */
+    private openOverlayHost(): void {
+        if (this.overlayEl) { try { this.overlayFrame?.contentWindow?.focus(); } catch { /* ignore */ } return; }
+        this.refreshData();
+        const snap = this.buildMapSnapshot();
+        if (!snap) { this.warn('map: data not ready (log in / move around first)'); return; }
+        const el = document.createElement('div');
+        el.id = 'eq-wm-overlay';
+        Object.assign(el.style, { position: 'fixed', top: '40px', left: '40px', right: '40px', bottom: '40px', zIndex: '2147483640', boxShadow: '0 6px 28px rgba(0,0,0,.6)', border: '1px solid #333', borderRadius: '6px', overflow: 'hidden', background: '#101012' });
+        const f = document.createElement('iframe');
+        Object.assign(f.style, { width: '100%', height: '100%', border: '0', display: 'block' });
+        f.srcdoc = this.buildMapWindowHtml(snap, 'overlay');
+        el.appendChild(f);
+        document.body.appendChild(el);
+        this.overlayEl = el; this.overlayFrame = f;
+        this.hookOverlayMessages();
+        f.addEventListener('load', () => { const s = this.buildMapSnapshot(); if (s) this.postToOverlay({ full: s, p: s.p }); });
+        this.startMapWindowUpdates();
+        this.info('map opened (overlay).');
+    }
+
+    /** Receive input (click-move / floor / mode / close) posted by the overlay iframe. */
+    private hookOverlayMessages(): void {
+        if (this.overlayMsgHooked) return;
+        this.overlayMsgHooked = true;
+        window.addEventListener('message', (e: MessageEvent) => {
+            const d: any = e.data;
+            if (d && d.__wmInput) this.handleMapWindowInput(d.__wmInput);
+        });
+    }
+
+    private closeOverlayHost(): void {
+        if (this.overlayEl) { try { this.overlayEl.remove(); } catch { /* ignore */ } }
+        this.overlayEl = null; this.overlayFrame = null;
+        if (!this.mapWindowOpen) this.stopMapWindowUpdates();
+    }
+
+    private postToOverlay(payload: any): void {
+        try { this.overlayFrame?.contentWindow?.postMessage({ __wmUpdate: payload }, '*'); } catch { /* ignore */ }
+    }
+    /** Push a data payload to whichever host(s) are currently open. */
+    private pushToViewer(payload: any): void {
+        if (this.mapWindowOpen) { const ipc = (window as any).electron?.ipcRenderer; ipc?.send('map-window:update', payload); }
+        if (this.overlayFrame) this.postToOverlay(payload);
+    }
+
+    /** The ⇄ toggle: switch between window and overlay hosts, remembering the choice. */
+    private switchMode(): void {
+        const target: 'window' | 'overlay' = this.mapMode === 'window' ? 'overlay' : 'window';
+        if (this.mapMode === 'window' && this.mapWindowOpen) {
+            const ipc = (window as any).electron?.ipcRenderer; ipc?.send('map-window:close'); this.mapWindowOpen = false;
+        }
+        if (this.mapMode === 'overlay') this.closeOverlayHost();
+        this.mapMode = target; this.saveFilterState();
+        if (target === 'overlay') this.openOverlayHost(); else this.openWindowHost();
     }
 
     /** Re-attach to a detached map window that survived a renderer reload (the game's 5-min
@@ -2244,9 +2307,13 @@ export default class WorldMapPlugin extends Plugin {
                 this.updateFloorLabel();
                 this.refreshData();
                 const snap = this.buildMapSnapshot();
-                const ipc = (window as any).electron?.ipcRenderer;
-                if (snap) ipc?.send('map-window:update', { full: snap, p: snap.p });
+                if (snap) this.pushToViewer({ full: snap, p: snap.p });
             }
+        } else if (msg.t === 'mode') {
+            this.switchMode();
+        } else if (msg.t === 'close') {
+            if (this.overlayEl) this.closeOverlayHost();
+            else if (this.mapWindowOpen) { const ipc = (window as any).electron?.ipcRenderer; ipc?.send('map-window:close'); }
         } else if (msg.t === 'chat') {
             const textToCopy = msg.text;
             const chatInput = document.getElementById('chat-input') as HTMLInputElement;
@@ -2260,25 +2327,26 @@ export default class WorldMapPlugin extends Plugin {
         }
     }
 
+    private viewerOpen(): boolean { return this.mapWindowOpen || !!this.overlayEl; }
+
     private startMapWindowUpdates(): void {
         this.stopMapWindowUpdates();
-        const ipc = (window as any).electron?.ipcRenderer;
         // Frequent + cheap: keep the data store fresh and stream the player position.
         this.mapWindowTimer = setInterval(() => {
-            if (!this.mapWindowOpen) return;
+            if (!this.viewerOpen()) return;
             this.refreshData();
             const p = this.getPlayerPos();
-            // Player position + live entities stream frequently so the window feels live.
+            // Player position + live entities stream frequently so the viewer feels live.
             const npc = this.liveNpcs.filter((n) => (n.floor ?? 0) === this.currentFloor).map((n) => ({ x: n.x, z: n.z, n: this.prettify(n.name), l: n.level ?? 0 }));
             const pl = this.players.map((q) => ({ x: q.x, z: q.z, n: q.name }));
-            ipc?.send('map-window:update', { p: p ? { x: p.x, z: p.z } : null, npc, pl, online: !!p, dest: this.getMoveDest() });
+            this.pushToViewer({ p: p ? { x: p.x, z: p.z } : null, npc, pl, online: !!p, dest: this.getMoveDest() });
         }, 280);
         // Occasional + heavy: push a full snapshot to pick up newly explored terrain/markers.
         this.mapWindowFullTimer = setInterval(() => {
-            if (!this.mapWindowOpen) return;
+            if (!this.viewerOpen()) return;
             this.refreshData();
             const snap = this.buildMapSnapshot();
-            if (snap) ipc?.send('map-window:update', { full: snap, p: snap.p });
+            if (snap) this.pushToViewer({ full: snap, p: snap.p });
         }, 7000);
     }
 
@@ -2377,7 +2445,7 @@ export default class WorldMapPlugin extends Plugin {
      *  stepper, follow, filters). When the game is live it receives streamed data updates and
      *  forwards click-to-move / floor changes back over IPC; offline it stays a static
      *  snapshot with Follow greyed out. */
-    private buildMapWindowHtml(data: any): string {
+    private buildMapWindowHtml(data: any, host: 'window' | 'overlay' = 'window'): string {
         const json = JSON.stringify(data);
         // The window is a file:// page (cross-origin to evilquest.net), so it can't rotate the
         // stone tile itself — use the pre-baked rotated data URL, falling back to the raw tile.
@@ -2394,6 +2462,7 @@ html,body{margin:0;height:100%;background:#101012;color:#e8e8e8;font:13px/1.4 In
 .btn{padding:5px 12px;border:none;border-radius:4px;color:#fff;font-size:13px;cursor:pointer;white-space:nowrap}
 #follow{background:#27ae60}#follow.off{background:#3a3f44}#follow.dis{opacity:.45;cursor:default}
 #close{background:transparent;color:#ccc;font-size:16px;padding:4px 9px;line-height:1}#close:hover{background:#e74c3c;color:#fff}
+#modeToggle{background:#2f6db0;color:#fff;font-weight:600;border:1px solid #5a9fe0}#modeToggle:hover{background:#3f86d6}
 #body{flex:1;display:flex;min-height:0}
 #side{width:210px;flex:none;overflow:auto;background:#161616;border-right:1px solid #333;padding:6px 10px}
 #layers{padding-bottom:6px;border-bottom:1px solid #333;margin-bottom:6px}
@@ -2414,7 +2483,7 @@ html,body{margin:0;height:100%;background:#101012;color:#e8e8e8;font:13px/1.4 In
 </style></head><body><div id="app">
 <div id="hdr"><h1>World Map</h1><input id="q" placeholder="Search objects & NPCs…">
 <div class="fl"><button id="fdown" title="Floor down">▾</button><span id="fl">Floor 0</span><button id="fup" title="Floor up">▴</button></div>
-<button id="follow" class="btn">◉ Follow</button><button id="close" class="btn" title="Close">✕</button></div>
+<button id="follow" class="btn">◉ Follow</button><button id="modeToggle" class="btn" title="Switch between overlay and window mode">⇆ ${host === 'window' ? 'Overlay' : 'Window'}</button>${host === 'overlay' ? '<button id="close" class="btn" title="Close">✕</button>' : ''}</div>
 <div id="body"><div id="side"><div id="layers">
 <label><input type="checkbox" id="L_ic" checked> Model icons</label>
 <label><input type="checkbox" id="L_poi" checked> Minimap markers</label>
@@ -2423,7 +2492,12 @@ html,body{margin:0;height:100%;background:#101012;color:#e8e8e8;font:13px/1.4 In
 <label><input type="checkbox" id="L_lab"> Labels</label></div><div id="cats"></div></div>
 <div id="view"><canvas id="c"></canvas><div id="tip"></div><div id="hint">drag to pan · scroll to zoom · click to walk</div><div id="loading"><div class="lspin"></div><div>Loading map…</div></div></div></div></div>
 <script>(function(){var D=${json};
+var HOST=${JSON.stringify(host)};
+/* One viewer, two hosts: a detached BrowserWindow talks over IPC; an in-page iframe overlay
+   talks over postMessage. sendInput()/applyUpdate() abstract the transport so the rest of the
+   viewer is identical in both. */
 var IPC=(window.electron&&window.electron.ipcRenderer)?window.electron.ipcRenderer:null;
+function sendInput(m){if(IPC){IPC.send("map-window:input",m);}else{try{parent.postMessage({__wmInput:m},"*");}catch(e){}}}
 var view=document.getElementById("view"),cv=document.getElementById("c"),ctx=cv.getContext("2d"),tip=document.getElementById("tip"),q=document.getElementById("q");
 var terrain,ICONS,MM,ICONS_S;
 function loadImgs(){terrain=new Image();terrain.onload=function(){var l=document.getElementById("loading");if(l)l.style.display="none";baseSig="";requestRender();};terrain.src=D.t;ICONS=(D.ic||[]).map(function(s){var i=new Image();i.src=s;return i;});ICONS_S=new Array(ICONS.length);MM=(D.mm||[]).map(function(s){var i=new Image();i.src=s;return i;});}
@@ -2514,7 +2588,7 @@ function clickAt(e){var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.
 var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}
 var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);var wx=sl+mx/Z,wz=st+my/Z;
 if(best){var m=best.s.match(/(-?\\d+),(-?\\d+)/);if(m){goTo(parseInt(m[1]),parseInt(m[2]));}}
-else if(D.online&&IPC){IPC.send("map-window:input",{t:"move",x:Math.round(wx),z:Math.round(wz)});}}
+else if(D.online){sendInput({t:"move",x:Math.round(wx),z:Math.round(wz)});}}
 view.addEventListener("mousedown",function(e){if(e.button!==0)return;pressed=true;dragging=false;sx0=lx0=e.clientX;sy0=ly0=e.clientY;pressT=Date.now();});
 window.addEventListener("mouseup",function(e){if(pressed&&!dragging&&e.target&&(view===e.target||view.contains(e.target)))clickAt(e);pressed=false;dragging=false;view.classList.remove("drag");});
 view.addEventListener("mousemove",function(e){if(pressed){if(!dragging){var dist=Math.abs(e.clientX-sx0)+Math.abs(e.clientY-sy0);if((dist>DRAG_THRESH&&(Date.now()-pressT)>HOLD_MS)||dist>DRAG_THRESH*3){dragging=true;setFollow(false);view.classList.add("drag");}}if(dragging){cx-=(e.clientX-lx0)/Z;cz-=(e.clientY-ly0)/Z;lx0=e.clientX;ly0=e.clientY;requestRender();tip.style.display="none";}return;}
@@ -2524,9 +2598,10 @@ view.addEventListener("wheel",function(e){e.preventDefault();var r=view.getBound
 view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){if(!m.contains(ev.target)){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});
 function setFollow(on){follow=on&&!!D.online;var b=document.getElementById("follow");b.className="btn"+(D.online?"":" dis")+(follow?"":" off");b.innerText=(follow?"◉":"○")+" Follow";if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;render();}}
 document.getElementById("follow").onclick=function(){if(!D.online)return;setFollow(!follow);};
-document.getElementById("fdown").onclick=function(){if(IPC)IPC.send("map-window:input",{t:"floor",f:(D.floor||0)-1});};
-document.getElementById("fup").onclick=function(){if(IPC)IPC.send("map-window:input",{t:"floor",f:(D.floor||0)+1});};
-document.getElementById("close").onclick=function(){if(IPC)IPC.send("map-window:close");};
+document.getElementById("fdown").onclick=function(){sendInput({t:"floor",f:(D.floor||0)-1});};
+document.getElementById("fup").onclick=function(){sendInput({t:"floor",f:(D.floor||0)+1});};
+var _mt=document.getElementById("modeToggle");if(_mt)_mt.onclick=function(){sendInput({t:"mode"});};
+var _cb=document.getElementById("close");if(_cb)_cb.onclick=function(){sendInput({t:"close"});};
 document.getElementById("L_ic").onchange=function(e){showIcons=e.target.checked;render();};
 document.getElementById("L_poi").onchange=function(e){showPoi=e.target.checked;render();};
 var NPCLBL=["Off","Stored","Live"];function setNpcMode(m){npcMode=((m%3)+3)%3;var el=document.getElementById("npcmodelbl");if(el)el.textContent=NPCLBL[npcMode];requestRender();}
@@ -2554,11 +2629,13 @@ var chSw=head.querySelector(".ci,.sw");if(chSw){chSw.style.cursor="pointer";chSw
 head.querySelector(".exp").onclick=function(){var open=subs.style.display==="none";subs.style.display=open?"block":"none";this.textContent=open?"▾":"▸";catOpen[c]=open;};
 g.appendChild(head);g.appendChild(subs);box.appendChild(g);});}
 function setLabel(){document.getElementById("fl").innerText="Floor "+(D.floor||0);}
-if(IPC&&IPC.on){IPC.on("map-window:update",function(e,u){if(!u)return;
+function applyUpdate(u){if(!u)return;
 if(u.full){var nd=u.full;D=nd;loadImgs();taxState();buildNpcIcon();buildCats();setLabel();dataVer++;}
 if(u.p!==undefined)D.p=u.p;if(u.npc!==undefined)D.npc=u.npc;if(u.pl!==undefined)D.pl=u.pl;if(u.online!==undefined)D.online=u.online;
 if(u.dest!==undefined){var had=!!D.dest;D.dest=u.dest;if(D.dest&&!had)destT0=performance.now();}
-setFollow(follow);if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;}if(u.goTo){setFollow(false);goTo(u.goTo.x,u.goTo.z);}ensureDestAnim();requestRender();});}
+setFollow(follow);if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;}if(u.goTo){setFollow(false);goTo(u.goTo.x,u.goTo.z);}ensureDestAnim();requestRender();}
+if(IPC&&IPC.on)IPC.on("map-window:update",function(e,u){applyUpdate(u);});
+window.addEventListener("message",function(e){var d=e&&e.data;if(d&&d.__wmUpdate)applyUpdate(d.__wmUpdate);});
 buildCats();setLabel();setFollow(true);ensureDestAnim();
 window.addEventListener("resize",resize);[terrain].concat(ICONS,MM).forEach(function(im){im.addEventListener("load",requestRender);});setTimeout(render,300);setTimeout(render,1200);
 resize();fit();})();</script></body></html>`;
