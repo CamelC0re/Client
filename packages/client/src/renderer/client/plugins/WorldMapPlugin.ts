@@ -284,6 +284,7 @@ export default class WorldMapPlugin extends Plugin {
         if (!cm || !this.gm?.scene) { if (attempt < 90) setTimeout(() => this.warmUp(attempt + 1), 1000); return; }
         this.warmedUp = true;
         try {
+            this.bakeStoneTexture();       // rotate the stone tile for the detached window
             await this.initIconSystem();   // load prebaked icon cache + Babylon -> bjsState ready
             this.refreshData();            // populate objectStore / markers / NPCs (queues icon renders)
             this.rebuildWorldCanvas(cm);   // build terrain + walls
@@ -930,30 +931,37 @@ export default class WorldMapPlugin extends Plugin {
         this.installCanvasControls();
     }
 
-    /** Apply the game's dark-stone tile to the map container, rotated 90° so the brick
-     *  courses run horizontally (matching the rest of the vanilla UI). CSS can't rotate a
-     *  background-image, so we pre-rotate the tile onto a canvas and use the data URL. The
-     *  texture is same-origin, so reading it back doesn't taint anything. */
+    /** The game's dark-stone tile, rotated 90° (brick courses horizontal), as a data URL.
+     *  Baked once in the game renderer (same-origin) so the detached map window — a file://
+     *  page that can't rotate the cross-origin texture itself without tainting — can reuse it. */
+    private stoneTexBaked: string | null = null;
+    private bakeStoneTexture(): Promise<string | null> {
+        if (this.stoneTexBaked) return Promise.resolve(this.stoneTexBaked);
+        return new Promise((resolve) => {
+            const img = new Image();
+            img.onload = () => {
+                try {
+                    const w = img.naturalWidth, h = img.naturalHeight;
+                    const c = document.createElement('canvas');
+                    c.width = h; c.height = w; // swap dims for the 90° turn
+                    const cx = c.getContext('2d')!;
+                    cx.translate(c.width / 2, c.height / 2);
+                    cx.rotate(Math.PI / 2);
+                    cx.drawImage(img, -w / 2, -h / 2);
+                    this.stoneTexBaked = c.toDataURL('image/png');
+                } catch { this.stoneTexBaked = null; }
+                resolve(this.stoneTexBaked);
+            };
+            img.onerror = () => resolve(null);
+            img.src = 'https://evilquest.net/ui/stone-dark.png';
+        });
+    }
+
+    /** Apply the rotated dark-stone tile to the map container (matching the vanilla UI). */
     private applyContainerTexture(el: HTMLElement) {
         const overlay = 'linear-gradient(rgba(15,12,10,0.30), rgba(15,12,10,0.45))';
-        const url = 'https://evilquest.net/ui/stone-dark.png';
-        const img = new Image();
-        img.onload = () => {
-            try {
-                const w = img.naturalWidth, h = img.naturalHeight;
-                const c = document.createElement('canvas');
-                c.width = h; c.height = w; // swap dims for the 90° turn
-                const cx = c.getContext('2d')!;
-                cx.translate(c.width / 2, c.height / 2);
-                cx.rotate(Math.PI / 2);
-                cx.drawImage(img, -w / 2, -h / 2);
-                el.style.backgroundImage = `${overlay}, url("${c.toDataURL('image/png')}")`;
-            } catch {
-                el.style.backgroundImage = `${overlay}, url("${url}")`; // unrotated fallback
-            }
-        };
-        img.onerror = () => { el.style.backgroundImage = `${overlay}, url("${url}")`; };
-        img.src = url;
+        const raw = 'https://evilquest.net/ui/stone-dark.png';
+        this.bakeStoneTexture().then((u) => { el.style.backgroundImage = `${overlay}, url("${u || raw}")`; });
     }
 
     private styleButton(btn: HTMLButtonElement, bg: string) {
@@ -1917,10 +1925,13 @@ export default class WorldMapPlugin extends Plugin {
      *  snapshot with Follow greyed out. */
     private buildMapWindowHtml(data: any): string {
         const json = JSON.stringify(data);
+        // The window is a file:// page (cross-origin to evilquest.net), so it can't rotate the
+        // stone tile itself — use the pre-baked rotated data URL, falling back to the raw tile.
+        const bg = this.stoneTexBaked || 'https://evilquest.net/ui/stone-dark.png';
         return `<!doctype html><html><head><meta charset="utf-8"><title>EvilLite — World Map</title><style>
 html,body{margin:0;height:100%;background:#101012;color:#e8e8e8;font:13px/1.4 Inter,system-ui,sans-serif;overflow:hidden;user-select:none}
 #app{display:flex;flex-direction:column;height:100vh}
-#hdr{display:flex;align-items:center;gap:8px;padding:6px 8px;background:linear-gradient(rgba(15,12,10,.35),rgba(15,12,10,.5)),url("https://evilquest.net/ui/stone-dark.png");border-bottom:1px solid #333}
+#hdr{display:flex;align-items:center;gap:8px;padding:6px 8px;background:linear-gradient(rgba(15,12,10,.35),rgba(15,12,10,.5)),url("${bg}");border-bottom:1px solid #333}
 #hdr h1{font-size:14px;margin:0 4px 0 2px;white-space:nowrap}
 #q{flex:1;max-width:240px;padding:5px 8px;border:1px solid #555;border-radius:4px;background:#111;color:#fff;font-size:13px}
 .fl{display:flex;align-items:center;gap:1px;background:rgba(0,0,0,.28);border-radius:6px;padding:2px 3px}
@@ -1939,7 +1950,7 @@ html,body{margin:0;height:100%;background:#101012;color:#e8e8e8;font:13px/1.4 In
 #cats .sub{display:block;padding:2px 0;font-size:12px;color:#bbb;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
 #cats .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin:0 6px;vertical-align:middle}
 #cats .ci{width:20px;height:20px;object-fit:contain;vertical-align:middle;margin:0 5px}#cats .sub .ci{width:16px;height:16px}
-#view{flex:1;position:relative;overflow:hidden;background:linear-gradient(rgba(8,7,6,.55),rgba(8,7,6,.7)),url("https://evilquest.net/ui/stone-dark.png");cursor:grab}
+#view{flex:1;position:relative;overflow:hidden;background:linear-gradient(rgba(8,7,6,.55),rgba(8,7,6,.7)),url("${bg}");cursor:grab}
 #view.drag{cursor:grabbing}#c{position:absolute;inset:0}
 #tip{position:absolute;background:#000d;border:1px solid #444;border-radius:4px;padding:4px 7px;font-size:12px;pointer-events:none;display:none;max-width:240px}
 #hint{position:absolute;right:8px;bottom:8px;background:#000a;padding:4px 8px;border-radius:4px;font-size:11px;pointer-events:none;color:#bbb}
