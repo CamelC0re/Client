@@ -1692,9 +1692,11 @@ export default class WorldMapPlugin extends Plugin {
         }
 
         // Live entities on the current floor (so the detached window shows them moving).
+        // i = rendered 3D model-icon index (getNpcIcon queues the render + caches it); the
+        // viewer draws the model icon, falling back to a dot until it's ready.
         const npc = this.liveNpcs
             .filter((n) => (n.floor ?? 0) === this.currentFloor)
-            .map((n) => ({ x: n.x, z: n.z, n: this.prettify(n.name), l: n.level ?? 0 }));
+            .map((n) => ({ x: n.x, z: n.z, n: this.prettify(n.name), l: n.level ?? 0, i: idxOf(this.getNpcIcon(n.defId)) }));
         const pl = this.players.map((p) => ({ x: p.x, z: p.z, n: p.name }));
 
         const player = this.getPlayerPos();
@@ -1935,6 +1937,9 @@ loadImgs();
    draw loop is the single most expensive op, so we drop it and draw the pre-shadowed icon. */
 function shadowed(idx){if(ICONS_S[idx])return ICONS_S[idx];var im=ICONS[idx];if(!im||!im.complete||!im.naturalWidth)return null;var pad=4;var c=document.createElement("canvas");c.width=im.naturalWidth+pad*2;c.height=im.naturalHeight+pad*2;var x=c.getContext("2d");x.shadowColor="rgba(0,0,0,.55)";x.shadowBlur=2;x.drawImage(im,pad,pad);ICONS_S[idx]=c;return c;}
 var nameOn={};function taxState(){(D.ob||[]).forEach(function(o){if(nameOn[o.c+"|"+o.n]===undefined)nameOn[o.c+"|"+o.n]=true;});}taxState();
+/* NPC name -> model-icon index, learned from full snapshots; light position-only updates
+   reuse it so NPCs keep their 3D model icon between full snapshots. */
+var npcIcon={};function buildNpcIcon(){(D.npc||[]).forEach(function(N){if(N.i!==undefined&&N.i>=0)npcIcon[N.n]=N.i;});}buildNpcIcon();
 var showIcons=true,showPoi=true,showLab=false,showNpc=true,showPl=true,follow=true;
 var cx=D.W/2,cz=D.H/2,Z=4,W=0,Hh=0,hits=[];
 function clamp(v,a,b){return Math.max(a,Math.min(v,b));}
@@ -1964,7 +1969,11 @@ var sig=[cx,cz,Z,W,Hh,showIcons,showPoi,showLab,nameVer,dataVer].join(",");
 if(sig!==baseSig){buildBase();baseSig=sig;}
 ctx.clearRect(0,0,W,Hh);ctx.drawImage(base,0,0);hits=baseHits.slice();
 var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);
-if(showNpc&&D.npc){for(var ni=0;ni<D.npc.length;ni++){var N=D.npc[ni];var nx=(N.x+0.5-sl)*Z,ny=(N.z+0.5-st)*Z;if(nx<-10||nx>W+10||ny<-10||ny>Hh+10)continue;ctx.fillStyle="#f1c40f";ctx.strokeStyle="rgba(0,0,0,.6)";ctx.lineWidth=1;ctx.beginPath();ctx.arc(nx,ny,4,0,6.28);ctx.fill();ctx.stroke();hits.push({sx:nx,sy:ny,r:5,n:N.n+(N.l?" (lv "+N.l+")":""),s:"NPC - "+N.x+","+N.z});}}
+if(showNpc&&D.npc){for(var ni=0;ni<D.npc.length;ni++){var N=D.npc[ni];var nx=(N.x+0.5-sl)*Z,ny=(N.z+0.5-st)*Z;if(nx<-20||nx>W+20||ny<-20||ny>Hh+20)continue;
+var nii=(N.i!==undefined&&N.i>=0)?N.i:(npcIcon[N.n]!==undefined?npcIcon[N.n]:-1);var nsc=nii>=0?shadowed(nii):null;var nhr;
+if(nsc){var nim=ICONS[nii];var nsz=clamp(Z*2.6,20,44);var nk=nsz/nim.naturalWidth,ndw=nsc.width*nk,ndh=nsc.height*nk;ctx.drawImage(nsc,nx-ndw/2,ny-ndh/2,ndw,ndh);nhr=nsz/2;}
+else{ctx.fillStyle="#f1c40f";ctx.strokeStyle="rgba(0,0,0,.6)";ctx.lineWidth=1;ctx.beginPath();ctx.arc(nx,ny,4,0,6.28);ctx.fill();ctx.stroke();nhr=5;}
+hits.push({sx:nx,sy:ny,r:nhr,n:N.n+(N.l?" (lv "+N.l+")":""),s:"NPC - "+N.x+","+N.z});}}
 if(showPl&&D.pl){for(var pl2=0;pl2<D.pl.length;pl2++){var L=D.pl[pl2];var lx=(L.x+0.5-sl)*Z,ly=(L.z+0.5-st)*Z;if(lx<-10||lx>W+10||ly<-10||ly>Hh+10)continue;ctx.fillStyle="#2ecc71";ctx.strokeStyle="#fff";ctx.lineWidth=1;ctx.beginPath();ctx.arc(lx,ly,4,0,6.28);ctx.fill();ctx.stroke();hits.push({sx:lx,sy:ly,r:5,n:L.n,s:"Player - "+L.x+","+L.z});}}
 if(D.dest){var dsx=(D.dest.x+0.5-sl)*Z,dsy=(D.dest.z+0.5-st)*Z;drawDest(ctx,dsx,dsy);}
 if(D.p){var ppx=(D.p.x+0.5-sl)*Z,ppy=(D.p.z+0.5-st)*Z;ctx.save();ctx.fillStyle="#19b9ff";ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.beginPath();ctx.arc(ppx,ppy,6,0,6.28);ctx.fill();ctx.stroke();ctx.restore();}}
@@ -2018,7 +2027,7 @@ head.querySelector(".exp").onclick=function(){var open=subs.style.display==="non
 g.appendChild(head);g.appendChild(subs);box.appendChild(g);});}
 function setLabel(){document.getElementById("fl").innerText="Floor "+(D.floor||0);}
 if(IPC&&IPC.on){IPC.on("map-window:update",function(e,u){if(!u)return;
-if(u.full){var nd=u.full;D=nd;loadImgs();taxState();buildCats();setLabel();dataVer++;}
+if(u.full){var nd=u.full;D=nd;loadImgs();taxState();buildNpcIcon();buildCats();setLabel();dataVer++;}
 if(u.p!==undefined)D.p=u.p;if(u.npc!==undefined)D.npc=u.npc;if(u.pl!==undefined)D.pl=u.pl;if(u.online!==undefined)D.online=u.online;
 if(u.dest!==undefined){var had=!!D.dest;D.dest=u.dest;if(D.dest&&!had)destT0=performance.now();}
 setFollow(follow);if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;}ensureDestAnim();requestRender();});}
