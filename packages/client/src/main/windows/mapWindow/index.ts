@@ -33,15 +33,29 @@ function focusExisting(): BrowserWindow | null {
 }
 
 export function registerMapWindowIPC(): void {
-    // Open (or focus) the map window. `html` is the full self-contained viewer document.
+    // Lets the renderer ask whether the detached window is still open. After the game's
+    // 5-min AFK kick the renderer (client.html) reloads, so the new plugin instance has
+    // forgotten the window — it queries this on startup to re-attach instead of leaving an
+    // orphaned, frozen window the user has to close and reopen.
+    ipcMain.handle('map-window:exists', () => !!(mapWindow && !mapWindow.isDestroyed()));
+
+    // Open the map window. `html` is the full self-contained viewer document. If a window is
+    // already open (normal reopen, or a re-attach after a renderer reload), reload it with
+    // the fresh content and re-point the input relay at the current renderer rather than
+    // returning early — this is what un-freezes an orphaned window after an AFK reload.
     ipcMain.on('map-window:open', async (event, html: string) => {
         try {
-            if (focusExisting()) return; // already open — data keeps flowing via :update
             const file = path.join(app.getPath('userData'), 'world-map-window.html');
             await fs.promises.writeFile(file, String(html ?? ''), 'utf-8');
 
             const sender: WebContents = event.sender;
-            gameSender = sender;
+            gameSender = sender; // always follow the current (possibly reloaded) renderer
+
+            if (mapWindow && !mapWindow.isDestroyed()) {
+                await mapWindow.loadFile(file); // refresh content (re-attach / reopen)
+                focusExisting();
+                return;
+            }
             const win = new BrowserWindow({
                 width: 980, height: 760, minWidth: 360, minHeight: 280,
                 title: 'EvilLite — World Map',

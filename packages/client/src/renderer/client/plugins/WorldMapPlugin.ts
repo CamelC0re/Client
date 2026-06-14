@@ -56,6 +56,8 @@ interface NpcSighting {
     x: number;
     z: number;
     level: number | undefined;
+    floor?: number;   // floor the NPC was seen on (added later; old saves lack it → treated as 0)
+    seen?: number;    // last-seen timestamp (Date.now()); newest wins for "last-known position"
 }
 
 /** A developer-placed POI from mapData.minimapMarkers. */
@@ -90,6 +92,11 @@ export default class WorldMapPlugin extends Plugin {
             value: true,
             callback: this.onSettingsChanged_enabled.bind(this),
         },
+        popoutMode: {
+            text: 'Open Chat Links in Popout Window',
+            type: SettingsTypes.checkbox,
+            value: true,
+        },
     };
 
     // ── DOM ─────────────────────────────────────────────────────────────────────
@@ -106,6 +113,12 @@ export default class WorldMapPlugin extends Plugin {
     private worldW = 0;
     private worldH = 0;
     private worldWalls = new Uint8Array(0);
+    // Invalidates in-flight async terrain seeds when the canvas is recreated (floor/size change).
+    private worldSeedToken = 0;
+    // Throttle for re-baking the shipped terrain cache in dev (ms timestamp).
+    private lastTerrainBake = 0;
+    // Tracks live connectivity so we can self-heal the map on reconnect after an AFK kick.
+    private wasOnline = false;
 
     private renderInterval: any = null;
     private isStarted = false;
@@ -136,6 +149,12 @@ export default class WorldMapPlugin extends Plugin {
     private npcStore = new Map<number, Map<string, NpcSighting>>();
     private liveNpcs: LiveNpc[] = [];
     private liveNpcKeys = new Set<string>();
+    /** Per-session last-known position by entity id (unique per spawned NPC this session,
+     *  NOT stable across relogins). Lets us hand a live NPC off to an exact "last known"
+     *  marker when it leaves broadcast — and back to live when it returns — instead of the
+     *  fuzzy proximity dedup. Cleared on map change; persisted cross-session via npcStore. */
+    private sessionNpcs = new Map<number, { id: number; defId: number; name: string; x: number; z: number; floor: number; level: number | undefined; seen: number }>();
+    private static readonly MAX_SESSION_NPCS = 2000;
     private players: { name: string; x: number; z: number }[] = [];
     private minimapMarkers: MinimapMarker[] = [];
 
@@ -143,6 +162,9 @@ export default class WorldMapPlugin extends Plugin {
     private lastDataRefresh = 0;
     private lastSave = 0;
     private storeDirty = false;
+
+    private liveEphemeral: MapObject[] = [];
+    private ephemeralPurged = false;
 
     // ── Filter state ──────────────────────────────────────────────────────────────
     private disabledCats = new Set<string>();
@@ -173,6 +195,10 @@ export default class WorldMapPlugin extends Plugin {
     constructor() {
         super();
         try { this.installKeyHandler(); this.registerSidebarIcon(); } catch { /* managers not ready — start() retries */ }
+        // The game's 5-min AFK kick reloads client.html, which resets this plugin's window
+        // state but leaves the detached OS window open (it lives in the main process). Re-attach
+        // to it so it un-freezes on its own instead of needing a close+reopen.
+        try { void this.reattachMapWindow(); } catch { /* best effort */ }
     }
 
     init() {
@@ -251,11 +277,21 @@ export default class WorldMapPlugin extends Plugin {
                 link.addEventListener('click', (e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    this.toggleMap(true);
-                    this.centerX = x;
-                    this.centerZ = z;
-                    this.setFollow(false);
-                    this.zoom = 12; // Zoom in comfortably on the target
+                    const usePopout = this.settings.popoutMode?.value !== false;
+
+                    if (usePopout) {
+                        this.openMapWindow();
+                        const ipc = (window as any).electron?.ipcRenderer;
+                        if (ipc) {
+                            ipc.send('map-window:update', { goTo: { x, z } });
+                        }
+                    } else {
+                        this.toggleMap(true);
+                        this.centerX = x;
+                        this.centerZ = z;
+                        this.setFollow(false);
+                        this.zoom = 12; // Zoom in comfortably on the target
+                    }
                 });
 
                 fragment.appendChild(link);
@@ -295,9 +331,17 @@ export default class WorldMapPlugin extends Plugin {
         try {
             this.bakeStoneTexture();       // rotate the stone tile for the detached window
             await this.initIconSystem();   // load prebaked icon cache + Babylon -> bjsState ready
+            void this.renderAllIcons();    // bulk preload all icons in the background
             this.refreshData();            // populate objectStore / markers / NPCs (queues icon renders)
             this.rebuildWorldCanvas(cm);   // build terrain + walls
             setTimeout(() => this.refreshData(), 1500); // settle pass for late-streaming defs
+            // If a detached window was re-attached after an AFK reload, push live data now so
+            // it swaps from the offline bundle to the live map without waiting for the timer.
+            if (this.mapWindowOpen) {
+                const ipc = (window as any).electron?.ipcRenderer;
+                const s = this.buildMapSnapshot();
+                if (s) ipc?.send('map-window:update', { full: s, p: s.p });
+            }
             this.info('warm-up complete — map ready to open instantly.');
         } catch { /* best effort */ }
     }
@@ -419,7 +463,7 @@ export default class WorldMapPlugin extends Plugin {
      *  per-placement assetId. Trailing version numbers are dropped so variants group. */
     private prettifyAsset(a: string): string {
         return (a || '')
-            .replace(/\.glb$/i, '')
+            .replace(/\.(glb|gltf)$/i, '')
             .replace(/[_-]+/g, ' ')
             .replace(/([a-z])([A-Z])/g, '$1 $2') // camelCase boundary
             .replace(/([A-Za-z])(\d)/g, '$1 $2')  // letter→digit boundary
@@ -430,10 +474,28 @@ export default class WorldMapPlugin extends Plugin {
     }
 
     // ── Data collection + accumulation ────────────────────────────────────────────
+    /** Detect a reconnect (offline→online). The 5-min AFK kick boots you and the game
+     *  tears the world down and later rebuilds it; the in-memory worldCanvas is then stale
+     *  (or was repainted blank mid-teardown). On the offline→online edge, drop the terrain
+     *  so the next rebuild recreates it fresh and re-seeds from the saved caches — this makes
+     *  an already-open map window self-heal without the user closing and reopening it. */
+    private syncConnectivity(): void {
+        const cm = this.getChunkManager();
+        const live = !!(cm && (cm.mapWidth | 0) && ((cm.tilePaintedEntries?.size | 0) > 0)) && !!this.getPlayerPos();
+        if (live && !this.wasOnline) {
+            this.worldCanvas = null;     // force a clean rebuild (+ re-seed from caches)
+            this.lastPaintedSize = -1;
+            this.lastRebuild = 0;
+        }
+        this.wasOnline = live;
+    }
+
     private refreshData() {
         const now = performance.now();
         if (now - this.lastDataRefresh < 500) return;
         this.lastDataRefresh = now;
+
+        this.syncConnectivity();
 
         const gm = this.gm;
         if (!gm) return;
@@ -445,6 +507,7 @@ export default class WorldMapPlugin extends Plugin {
             this.mapId = id;
             this.objectStore.clear();
             this.npcStore.clear();
+            this.sessionNpcs.clear();
             this.catSampleObj.clear();
             this.nameSampleObj.clear();
             this.catRepIcon.clear();
@@ -478,11 +541,26 @@ export default class WorldMapPlugin extends Plugin {
         if (this.storeDirty && now - this.lastSave > 4000) this.persistStores();
     }
 
+    /** True for transient, player-/event-created objects that must not be persisted (fire). */
+    private isEphemeralObject(name: string, assetId: string): boolean {
+        return /^fire$/i.test(name) || /^fire$/i.test(assetId);
+    }
+
     private collectObjects() {
         const gm = this.gm;
         const wod: Map<any, any> | undefined = gm.worldObjectDefs;
         const defs: Map<any, any> | undefined = gm.objectDefsCache;
         if (!wod || !defs) return;
+        
+        this.liveEphemeral = []; // rebuilt from the live world every scan
+        // One-time purge of any ephemeral objects a prior version persisted (stale ghost fires).
+        if (!this.ephemeralPurged) {
+            this.ephemeralPurged = true;
+            for (const [k, o] of this.objectStore) {
+                if (this.isEphemeralObject(o.name, o.assetId || '')) { this.objectStore.delete(k); this.storeDirty = true; }
+            }
+        }
+        
         // worldObjectDefs has the category/name (via defId) but NO model; the loaded
         // mesh — keyed by the SAME key in worldObjectModels — carries metadata.assetId,
         // which is the key into assetRegistry for the real model. Join them here.
@@ -508,6 +586,13 @@ export default class WorldMapPlugin extends Plugin {
             const specificName = category === 'scenery' && assetId ? this.prettifyAsset(assetId) : '';
             const name = placedName || specificName || defName;
             const key = `${rec.x},${rec.z},${floor},${rec.defId}`;
+            // Transient objects (fire) are shown live but never stored — and any stale copy
+            // is dropped so it can't outlive the real object.
+            if (this.isEphemeralObject(name, assetId)) {
+                this.liveEphemeral.push({ defId: rec.defId, category, name, x: rec.x, z: rec.z, floor, depleted: !!rec.depleted, assetId });
+                if (this.objectStore.has(key)) { this.objectStore.delete(key); this.storeDirty = true; }
+                continue;
+            }
             const existing = this.objectStore.get(key);
             const depleted = !!rec.depleted;
             let stored = existing;
@@ -563,22 +648,82 @@ export default class WorldMapPlugin extends Plugin {
             const def = cache?.get(defId);
             const name = (def?.name ?? `NPC #${defId}`) + '';
             const level = ents.npcCombatLevels?.get(id);
+
             this.liveNpcs.push({ id, defId, name, x, z, floor, level });
             this.liveNpcKeys.add(`${defId}:${Math.round(x)},${Math.round(z)}`);
             if (!this.npcNameDef.has(name)) this.npcNameDef.set(name, defId);
+
+            // Track this exact NPC instance for the session so it keeps a precise last-known
+            // position after it walks out of broadcast (and resumes live when it returns).
+            const se = this.sessionNpcs.get(id);
+            if (se) { 
+                // Overwrite identity fields too, since the server recycles Entity IDs!
+                se.defId = defId; se.name = name; 
+                se.x = x; se.z = z; se.floor = floor; se.level = level; se.seen = Date.now(); 
+            }
+            else {
+                if (this.sessionNpcs.size >= WorldMapPlugin.MAX_SESSION_NPCS) {
+                    const oldest = this.sessionNpcs.keys().next().value; // Map preserves insertion order
+                    if (oldest !== undefined) this.sessionNpcs.delete(oldest);
+                }
+                this.sessionNpcs.set(id, { id, defId, name, x, z, floor, level, seen: Date.now() });
+            }
 
             // Accumulate sighting (rounded to a tile).
             const rx = Math.round(x), rz = Math.round(z);
             let perDef = this.npcStore.get(defId);
             if (!perDef) { perDef = new Map(); this.npcStore.set(defId, perDef); }
             const skey = `${rx},${rz}`;
-            if (!perDef.has(skey)) {
+            const existing = perDef.get(skey);
+            if (!existing) {
                 if (perDef.size >= WorldMapPlugin.MAX_SIGHTINGS_PER_NPC) {
                     const first = perDef.keys().next().value;
                     if (first !== undefined) perDef.delete(first);
                 }
-                perDef.set(skey, { defId, name, x: rx, z: rz, level });
+                perDef.set(skey, { defId, name, x: rx, z: rz, level, floor, seen: Date.now() });
                 this.storeDirty = true;
+            } else {
+                // Re-seen: refresh recency (+ backfill floor for pre-upgrade saves).
+                existing.seen = Date.now();
+                if (existing.floor === undefined) existing.floor = floor;
+            }
+        }
+
+        // --- Cleanup Pass: Remove ghost artifacts ---
+        // If there's a stored marker within broadcast range (35 tiles) and no live NPC 
+        // matches it, it means the NPC despawned or died. Delete the artifact!
+        const px = ents.player?.x, pz = ents.player?.z;
+        if (px != null && pz != null) {
+            const VERIFY_DIST = 35 * 35; 
+            
+            // 1. Prune sessionNpcs
+            for (const [id, s] of this.sessionNpcs) {
+                if ((s.floor ?? 0) === this.currentFloor) {
+                    const dx = s.x - px, dz = s.z - pz;
+                    if (dx * dx + dz * dz < VERIFY_DIST) {
+                        if (!this.liveNpcs.some(n => n.id === id)) {
+                            this.sessionNpcs.delete(id);
+                        }
+                    }
+                }
+            }
+
+            // 2. Prune npcStore
+            for (const [defId, clusters] of this.npcStore) {
+                for (const [skey, m] of clusters) {
+                    if ((m.floor ?? 0) === this.currentFloor) {
+                        const dx = m.x - px, dz = m.z - pz;
+                        if (dx * dx + dz * dz < VERIFY_DIST) {
+                            // Require a live NPC of this type to be within ~15 tiles of the cluster point
+                            const hasLive = this.liveNpcs.some(n => n.defId === defId && Math.pow(n.x - m.x, 2) + Math.pow(n.z - m.z, 2) < 225);
+                            if (!hasLive) {
+                                clusters.delete(skey);
+                                this.storeDirty = true;
+                            }
+                        }
+                    }
+                }
+                if (clusters.size === 0) this.npcStore.delete(defId);
             }
         }
     }
@@ -671,8 +816,9 @@ export default class WorldMapPlugin extends Plugin {
                 const entry = npc[defIdStr];
                 const m = new Map<string, NpcSighting>();
                 for (const p of entry.pts) {
-                    const [x, z, level] = p;
-                    m.set(`${x},${z}`, { defId, name: entry.name, x, z, level: level < 0 ? undefined : level });
+                    // [x, z, level, floor?, seen?] — floor/seen added later; old saves omit them.
+                    const [x, z, level, floor, seen] = p;
+                    m.set(`${x},${z}`, { defId, name: entry.name, x, z, level: level < 0 ? undefined : level, floor: floor ?? undefined, seen: seen || 0 });
                 }
                 this.npcStore.set(defId, m);
                 if (!this.npcNameDef.has(entry.name)) this.npcNameDef.set(entry.name, defId);
@@ -694,7 +840,7 @@ export default class WorldMapPlugin extends Plugin {
             const npcObj: Record<string, { name: string; pts: number[][] }> = {};
             for (const [defId, m] of this.npcStore) {
                 const first = m.values().next().value;
-                npcObj[defId] = { name: first?.name ?? `NPC #${defId}`, pts: [...m.values()].map((s) => [s.x, s.z, s.level ?? -1]) };
+                npcObj[defId] = { name: first?.name ?? `NPC #${defId}`, pts: [...m.values()].map((s) => [s.x, s.z, s.level ?? -1, s.floor ?? 0, s.seen ?? 0]) };
             }
             // Single assignment per map -> one reactive write (debounced by core).
             this.data.maps[this.mapId] = { obj: objArr, npc: npcObj };
@@ -1183,6 +1329,7 @@ export default class WorldMapPlugin extends Plugin {
 
         let dragging = false, moved = false, lastX = 0, lastY = 0;
         canvas.addEventListener('mousedown', (e) => {
+            if (e.button !== 0) return;
             dragging = true; moved = false; lastX = e.clientX; lastY = e.clientY;
             canvas.style.cursor = 'grabbing';
         });
@@ -1204,8 +1351,8 @@ export default class WorldMapPlugin extends Plugin {
             }
         });
         // Click a marker -> centre on it, OR click ground -> walk there.
-        canvas.addEventListener('click', () => {
-            if (moved || !this.hoverPos) return;
+        canvas.addEventListener('click', (e) => {
+            if (e.button !== 0 || moved || !this.hoverPos) return;
             const hit = this.pickHit(this.hoverPos.x, this.hoverPos.y);
             if (hit) { 
                 this.centerX = hit.wx; 
@@ -1250,7 +1397,7 @@ export default class WorldMapPlugin extends Plugin {
             }
         });
 
-        // Right-click -> Copy coordinate
+        // Right-click -> Context Menu
         canvas.addEventListener('contextmenu', (e) => {
             e.preventDefault();
             if (!this.hoverPos) return;
@@ -1268,24 +1415,64 @@ export default class WorldMapPlugin extends Plugin {
             let textToCopy = `(${worldX},${worldZ})`;
             const hit = this.pickHit(this.hoverPos.x, this.hoverPos.y);
             if (hit && hit.label) {
-                // Remove formatting or sub-labels, just take the raw name
                 const cleanLabel = hit.label.split('\n')[0].trim();
                 textToCopy += `[${cleanLabel}]`;
             }
 
+            this.showContextMenu(e.clientX, e.clientY, textToCopy);
+        });
+    }
+
+    private showContextMenu(x: number, y: number, textToCopy: string) {
+        let menu = document.getElementById('eq-map-context-menu');
+        if (menu) menu.remove();
+
+        menu = document.createElement('div');
+        menu.id = 'eq-map-context-menu';
+        Object.assign(menu.style, {
+            position: 'fixed', left: x + 'px', top: y + 'px',
+            background: '#473e32', border: '1px solid #1a1612', borderTopColor: '#72624d', borderLeftColor: '#72624d',
+            zIndex: '10000', boxShadow: '2px 2px 4px rgba(0,0,0,0.5)', userSelect: 'none', minWidth: '120px',
+            fontFamily: 'sans-serif'
+        });
+
+        const hdr = document.createElement('div');
+        Object.assign(hdr.style, {
+            background: '#362e24', padding: '4px 8px', borderBottom: '1px solid #1a1612',
+            color: '#ffd24a', fontWeight: 'bold', textAlign: 'center', fontSize: '12px', cursor: 'default'
+        });
+        hdr.textContent = 'Select an Option';
+        menu.appendChild(hdr);
+
+        const itm = document.createElement('div');
+        Object.assign(itm.style, {
+            padding: '6px 10px', cursor: 'pointer', color: '#fff', fontSize: '13px'
+        });
+        itm.textContent = `Share ${textToCopy}`;
+        itm.onmouseenter = () => itm.style.background = '#5c5040';
+        itm.onmouseleave = () => itm.style.background = 'transparent';
+        itm.onclick = (e) => {
+            e.stopPropagation();
+            menu!.remove();
+            
             const chatInput = document.getElementById('chat-input') as HTMLInputElement;
             if (chatInput) {
-                // If there's already text, append it with a space, otherwise just set it
                 const currentVal = chatInput.value.trim();
                 chatInput.value = currentVal ? `${currentVal} ${textToCopy}` : textToCopy;
                 chatInput.focus();
-                
-                // Optionally close the map so they can immediately hit enter or type
                 this.toggleMap(false);
-            } else {
-                this.setStatus('Chat input not found.');
             }
-        });
+        };
+        menu.appendChild(itm);
+        document.body.appendChild(menu);
+
+        const closeMenu = (e: MouseEvent) => {
+            if (!menu!.contains(e.target as Node)) {
+                menu!.remove();
+                window.removeEventListener('mousedown', closeMenu);
+            }
+        };
+        setTimeout(() => window.addEventListener('mousedown', closeMenu), 0);
     }
 
     private pickHit(x: number, y: number): HitTarget | null {
@@ -1389,6 +1576,62 @@ export default class WorldMapPlugin extends Plugin {
         return buf;
     }
 
+    private loadImage(src: string): Promise<HTMLImageElement> {
+        return new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = rej; im.src = src; });
+    }
+
+    /** Seed a freshly-(re)created worldCanvas with previously-explored terrain so the live
+     *  map survives reloads/logins instead of resetting to the chunks loaded right now.
+     *  Two sources, layered cheapest-first (later overwrites earlier):
+     *    1. shipped prebake (PluginAssetCache 'world-map-terrain') → packaged users get a
+     *       full map immediately (read-only in shipped builds).
+     *    2. the user's own localStorage accumulation ('eq_wm_offline') → their latest explore.
+     *  The composite is drawn with destination-over so the live current-region paint (opaque,
+     *  drawn synchronously by rebuildWorldCanvas right after creation) always wins — the seed
+     *  only fills the gaps. Walls are filled for cells untouched this session; the live region
+     *  self-corrects on the next rebuild. Fully async + token-guarded against floor/size change. */
+    private async seedWorldFromCaches(mapW: number, mapH: number, floor: number): Promise<void> {
+        const token = ++this.worldSeedToken;
+        const id = this.mapId || 'world';
+        const matches = (b: any) => b && b.id === id && b.floor === floor && b.W === mapW && b.H === mapH;
+
+        const layers: any[] = [];   // bottom-first: shipped prebake under the user's own accumulation
+        try {
+            const baked = await this.terrainCacheStore.load();
+            const pre = baked[`${id}:${floor}`];
+            if (pre) { const b = JSON.parse(pre); if (matches(b)) layers.push(b); }
+        } catch { /* no/invalid prebake */ }
+        if (token !== this.worldSeedToken) return;
+        const ls = this.loadOfflineBundle();
+        if (matches(ls)) layers.push(ls);
+        if (!layers.length) return;
+
+        const tmp = document.createElement('canvas');
+        tmp.width = mapW; tmp.height = mapH;
+        const tctx = tmp.getContext('2d');
+        if (!tctx) return;
+        let drewTerrain = false;
+        for (const b of layers) {
+            if (typeof b.t === 'string') {
+                try { const img = await this.loadImage(b.t); if (token !== this.worldSeedToken) return; tctx.drawImage(img, 0, 0); drewTerrain = true; } catch { /* skip */ }
+            }
+            if (Array.isArray(b.wl)) {
+                const ww = this.worldWalls;
+                for (let i = 0; i + 2 < b.wl.length; i += 3) {
+                    const x = b.wl[i] | 0, z = b.wl[i + 1] | 0, wf = b.wl[i + 2];
+                    if (x < 0 || x >= mapW || z < 0 || z >= mapH) continue;
+                    const k = z * mapW + x; if (!ww[k]) ww[k] = wf;
+                }
+            }
+        }
+        if (!drewTerrain || token !== this.worldSeedToken || !this.worldCtx) return;
+        const ctx = this.worldCtx;
+        ctx.save();
+        ctx.globalCompositeOperation = 'destination-over';
+        ctx.drawImage(tmp, 0, 0);
+        ctx.restore();
+    }
+
     private rebuildWorldCanvas(cm: any): boolean {
         const mapW = cm.mapWidth | 0;
         const mapH = cm.mapHeight | 0;
@@ -1403,6 +1646,10 @@ export default class WorldMapPlugin extends Plugin {
             this.worldWalls = new Uint8Array(mapW * mapH);
             this.worldCtx = this.worldCanvas.getContext('2d', { willReadFrequently: true });
             this.lastPaintedSize = -1;
+            // Seed the blank canvas with previously-explored terrain (shipped prebake +
+            // the user's own saved exploration) so the live map isn't reset to a tiny
+            // patch after a reload/login. Fire-and-forget; drawn behind the live region.
+            void this.seedWorldFromCaches(mapW, mapH, this.currentFloor);
         }
 
         const painted = cm.tilePaintedEntries?.size ?? 0;
@@ -1676,6 +1923,59 @@ export default class WorldMapPlugin extends Plugin {
      * the same tile-grouping, icon sizing, category filters, POIs and search. Exports the
      * DATA (terrain image + marker positions + icon images), not a flat PNG. Ctrl+Shift+E.
      */
+    /** Collapse persisted NPC sightings into one "last-known" marker per spawn. For each
+     *  defId we cluster its sighting tiles by proximity (a wanderer's trail → one marker;
+     *  two separate spawns of the same def → two) and emit the most-recently-seen tile of
+     *  each cluster. Respects the NPC category/name filters. Used for the Stored/Live NPC
+     *  modes in the window + offline view, where we have no live entities to draw. */
+    private buildNpcSightings(floor: number, iconIdxOf: (defId: number) => number): any[] {
+        const MERGE2 = 25 * 25; // positions within ~25 tiles = the same roaming NPC
+        const out: any[] = [];
+        const nameOff = (n: string) => this.disabledCats.has(WorldMapPlugin.NPC_CAT) || this.disabledNames.has(`${WorldMapPlugin.NPC_CAT}:${n}`);
+        // Per-defId list of already-placed marker positions, so cross-session clusters don't
+        // duplicate a marker the exact session data already covers.
+        const placed = new Map<number, { x: number; z: number }[]>();
+        const place = (defId: number, x: number, z: number, n: string, l: number) => {
+            out.push({ x, z, n: this.prettify(n), l, i: iconIdxOf(defId) });
+            let arr = placed.get(defId); if (!arr) { arr = []; placed.set(defId, arr); } arr.push({ x, z });
+        };
+        const covered = (defId: number, x: number, z: number) => {
+            const arr = placed.get(defId); if (!arr) return false;
+            for (const p of arr) { const dx = p.x - x, dz = p.z - z; if (dx * dx + dz * dz <= MERGE2) return true; }
+            return false;
+        };
+
+        // Seed `placed` with live NPCs so historical clusters near them are suppressed.
+        for (const n of this.liveNpcs) {
+            if ((n.floor ?? 0) === floor && !nameOff(n.name)) {
+                let arr = placed.get(n.defId); if (!arr) { arr = []; placed.set(n.defId, arr); } arr.push({ x: n.x, z: n.z });
+            }
+        }
+
+        // 1) Exact last-known per session NPC instance. We ALWAYS draw this (even if it's currently 
+        //    live) so that the faded Stored marker sits exactly beneath the bright Live marker.
+        //    When the live NPC walks out of range and vanishes, the Stored marker is already 
+        //    pre-loaded underneath it, preventing any flashing or out-of-order rendering.
+        for (const s of this.sessionNpcs.values()) {
+            if ((s.floor ?? 0) !== floor || nameOff(s.name)) continue;
+            place(s.defId, s.x, s.z, s.name, s.level ?? 0);
+        }
+
+        // 2) Cross-session persisted clusters for NPCs not seen (here) this session — fills in
+        //    spawns from prior sessions / offline. Cluster each def's tiles, newest tile wins.
+        for (const [defId, m] of this.npcStore) {
+            const name = (m.values().next().value?.name) ?? `NPC #${defId}`;
+            if (nameOff(name)) continue;
+            const pts = [...m.values()].filter((s) => (s.floor ?? 0) === floor).sort((a, b) => (b.seen ?? 0) - (a.seen ?? 0));
+            for (const s of pts) { 
+                if (!covered(defId, s.x, s.z)) {
+                    place(defId, s.x, s.z, name, s.level ?? 0); 
+                }
+            }
+        }
+        return out;
+    }
+
     /** Gather a full, self-contained snapshot of the explored map (terrain PNG + deduped
      *  icons + per-tile markers + categories + POIs + the player position). Used by both
      *  the HTML export and the detached map window. Returns null if the map isn't ready. */
@@ -1702,7 +2002,8 @@ export default class WorldMapPlugin extends Plugin {
             return i;
         };
         const groups = new Map<string, MapObject[]>();
-        for (const o of this.objectStore.values()) {
+        const allObjects = [...this.objectStore.values(), ...this.liveEphemeral];
+        for (const o of allObjects) {
             if (o.floor !== undefined && o.floor !== this.currentFloor) continue;
             const k = `${o.x},${o.z}`;
             let arr = groups.get(k); if (!arr) { arr = []; groups.set(k, arr); } arr.push(o);
@@ -1742,6 +2043,9 @@ export default class WorldMapPlugin extends Plugin {
             .filter((n) => (n.floor ?? 0) === this.currentFloor)
             .map((n) => ({ x: n.x, z: n.z, n: this.prettify(n.name), l: n.level ?? 0, i: idxOf(this.getNpcIcon(n.defId)) }));
         const pl = this.players.map((p) => ({ x: p.x, z: p.z, n: p.name }));
+        // Cached "last-known" NPC positions (one per spawn cluster) so the window/offline
+        // view can show NPCs when not live — the Off/Stored/Live switch keys off this + npc.
+        const ns = this.buildNpcSightings(this.currentFloor, (d) => idxOf(this.getNpcIcon(d)));
 
         // Sparse wall list [x,z,wf,...] (wf = N|E|S|W bitmask) so the viewer can draw the
         // vanilla white wall lines at screen scale, exactly like the in-game minimap.
@@ -1753,7 +2057,7 @@ export default class WorldMapPlugin extends Plugin {
         const data = {
             id: this.mapId || 'world', W, H, t: terrain, ic: icons, ob: objects, ct: cats, pi: pois, mm: mmIcons,
             floor: this.currentFloor, p: player ? { x: player.x, z: player.z } : null,
-            npc, pl, wl, online: !!player, dest: this.getMoveDest(),
+            npc, ns, pl, wl, online: !!player, dest: this.getMoveDest(),
         };
         this.saveOfflineBundle(data); // so the map still works after logout
         return data;
@@ -1765,12 +2069,37 @@ export default class WorldMapPlugin extends Plugin {
      *  builds, so neither is usable offline. Stripped of live entities; ~0.5-1MB for one map. */
     private saveOfflineBundle(data: any): void {
         try {
-            const b = { id: data.id, W: data.W, H: data.H, t: data.t, ic: data.ic, ob: data.ob, ct: data.ct, pi: data.pi, mm: data.mm, wl: data.wl, floor: data.floor };
-            localStorage.setItem('eq_wm_offline', JSON.stringify(b));
+            const b = { id: data.id, W: data.W, H: data.H, t: data.t, ic: data.ic, ob: data.ob, ct: data.ct, pi: data.pi, mm: data.mm, wl: data.wl, ns: data.ns, floor: data.floor };
+            // Don't let a degraded snapshot clobber a richer saved map. When the 5-min AFK
+            // kick (or any lost connection) tears the world down, a full-snapshot timer can
+            // fire mid-teardown and build a blank/partial terrain; without this guard it
+            // would overwrite the good offline bundle, so the logged-out map goes blank and
+            // a reopen is needed to recover. Keep the better terrain for this map+floor.
+            const prev = this.loadOfflineBundle();
+            if (prev && prev.id === b.id && prev.floor === b.floor &&
+                this.terrainScore(b) < this.terrainScore(prev) * 0.85) {
+                return; // saved bundle is meaningfully richer — keep it
+            }
+            const json = JSON.stringify(b);
+            localStorage.setItem('eq_wm_offline', json);
+            // Re-bake the shipped terrain cache (dev-only on the main side; no-op when
+            // packaged) so the committed full-map cache stays current as we explore.
+            // Throttled — terrain changes constantly and the bundle is large.
+            const now = Date.now();
+            if (now - this.lastTerrainBake > 30000) {
+                this.lastTerrainBake = now;
+                this.terrainCacheStore.save(`${b.id}:${b.floor}`, json);
+            }
         } catch { /* quota exceeded — offline map just won't have the latest */ }
     }
     private loadOfflineBundle(): any | null {
         try { const s = localStorage.getItem('eq_wm_offline'); return s ? JSON.parse(s) : null; } catch { return null; }
+    }
+    /** Rough "how much real map is in this bundle" score, for the save downgrade-guard.
+     *  Terrain PNG byte length tracks painted (non-transparent) area; walls add weight. */
+    private terrainScore(b: any): number {
+        if (!b) return 0;
+        return (typeof b.t === 'string' ? b.t.length : 0) + (Array.isArray(b.wl) ? b.wl.length * 8 : 0);
     }
 
     /** The live click-to-move destination (the vanilla minimap flag target), or null. */
@@ -1811,6 +2140,30 @@ export default class WorldMapPlugin extends Plugin {
         this.info('map window opened.');
     }
 
+    /** Re-attach to a detached map window that survived a renderer reload (the game's 5-min
+     *  AFK kick reloads client.html; the window lives in the main process and stays open).
+     *  Without this the window sits frozen on its last frame until the user closes+reopens it.
+     *  Asks the main process if the window exists and, if so, resumes streaming + reloads its
+     *  content with a fresh snapshot. Best-effort + idempotent (guarded by mapWindowOpen). */
+    private async reattachMapWindow(): Promise<void> {
+        const ipc = (window as any).electron?.ipcRenderer;
+        if (!ipc?.invoke || !ipc?.send || this.mapWindowOpen) return;
+        let exists = false;
+        try { exists = await ipc.invoke('map-window:exists'); } catch { return; }
+        if (!exists || this.mapWindowOpen) return;
+        this.mapWindowOpen = true;
+        if (!this.mwCloseHooked) {
+            this.mwCloseHooked = true;
+            ipc.on?.('map-window:closed', () => { this.mapWindowOpen = false; this.stopMapWindowUpdates(); });
+            ipc.on?.('map-window:input', (_e: any, msg: any) => this.handleMapWindowInput(msg));
+        }
+        try { this.refreshData(); } catch { /* not in-world yet — offline bundle still works */ }
+        const snap = this.buildMapSnapshot(); // offline bundle pre-login, live once warmed up
+        if (snap) ipc.send('map-window:open', this.buildMapWindowHtml(snap)); // main reloads the existing window
+        this.startMapWindowUpdates();
+        this.info('map window re-attached after reload.');
+    }
+
     /** Apply an action forwarded from the detached map window back to the live game. */
     private handleMapWindowInput(msg: any): void {
         if (!msg) return;
@@ -1835,6 +2188,16 @@ export default class WorldMapPlugin extends Plugin {
                 const snap = this.buildMapSnapshot();
                 const ipc = (window as any).electron?.ipcRenderer;
                 if (snap) ipc?.send('map-window:update', { full: snap, p: snap.p });
+            }
+        } else if (msg.t === 'chat') {
+            const textToCopy = msg.text;
+            const chatInput = document.getElementById('chat-input') as HTMLInputElement;
+            if (chatInput) {
+                const currentVal = chatInput.value.trim();
+                chatInput.value = currentVal ? `${currentVal} ${textToCopy}` : textToCopy;
+                chatInput.focus();
+            } else {
+                this.setStatus('Chat input not found.');
             }
         }
     }
@@ -1916,12 +2279,13 @@ export default class WorldMapPlugin extends Plugin {
 + '}'
 + 'function fit(){var pad=10;Z=clamp(Math.min(W/(D.W+pad),Hh/(D.H+pad)),0.3,48);cx=D.W/2;cz=D.H/2;render();}'
 + 'var dragging=false,lx=0,ly=0,moved=false;'
-+ 'view.addEventListener("mousedown",function(e){dragging=true;moved=false;lx=e.clientX;ly=e.clientY;view.classList.add("drag");});'
++ 'view.addEventListener("mousedown",function(e){if(e.button!==0)return;dragging=true;moved=false;lx=e.clientX;ly=e.clientY;view.classList.add("drag");});'
 + 'window.addEventListener("mouseup",function(){dragging=false;view.classList.remove("drag");});'
 + 'view.addEventListener("mousemove",function(e){if(dragging){var dx=e.clientX-lx,dy=e.clientY-ly;if(Math.abs(dx)+Math.abs(dy)>2)moved=true;cx-=dx/Z;cz-=dy/Z;lx=e.clientX;ly=e.clientY;render();tip.style.display="none";return;}'
 + 'var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top,best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}'
 + 'if(best){tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+10)+"px";tip.innerHTML="<b>"+best.n+"</b><br>"+best.s;}else tip.style.display="none";});'
 + 'view.addEventListener("wheel",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var f=e.deltaY<0?1.15:1/1.15;Z=clamp(Z*f,0.3,48);cx=wx+W/(2*Z)-mx/Z;cz=wz+Hh/(2*Z)-my/Z;render();},{passive:false});'
++ 'view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){if(!m.contains(ev.target)){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});'
 + 'function goTo(x,z){Z=Math.max(Z,12);cx=x+0.5;cz=z+0.5;render();}'
 + 'function buildTax(){var box=document.getElementById("cats");box.innerHTML="";var esc=function(t){var d=document.createElement("span");d.textContent=t;return d.innerHTML;};'
 + 'var catIcon={},nameIcon={};D.ob.forEach(function(o){if(o.i>=0){if(catIcon[o.c]===undefined)catIcon[o.c]=o.i;if(nameIcon[o.c+"|"+o.n]===undefined)nameIcon[o.c+"|"+o.n]=o.i;}});'
@@ -1996,7 +2360,7 @@ html,body{margin:0;height:100%;background:#101012;color:#e8e8e8;font:13px/1.4 In
 <div id="body"><div id="side"><div id="layers">
 <label><input type="checkbox" id="L_ic" checked> Model icons</label>
 <label><input type="checkbox" id="L_poi" checked> Minimap markers</label>
-<label><input type="checkbox" id="L_npc" checked> Live NPCs</label>
+<label id="npcmode" style="cursor:pointer" title="Click to cycle: Off / Stored / Live">NPCs: <b id="npcmodelbl">Live</b></label>
 <label><input type="checkbox" id="L_pl" checked> Players</label>
 <label><input type="checkbox" id="L_lab"> Labels</label></div><div id="cats"></div></div>
 <div id="view"><canvas id="c"></canvas><div id="tip"></div><div id="hint">drag to pan · scroll to zoom · click to walk</div><div id="loading"><div class="lspin"></div><div>Loading map…</div></div></div></div></div>
@@ -2013,7 +2377,7 @@ var nameOn={};function taxState(){(D.ob||[]).forEach(function(o){if(nameOn[o.c+"
 /* NPC name -> model-icon index, learned from full snapshots; light position-only updates
    reuse it so NPCs keep their 3D model icon between full snapshots. */
 var npcIcon={};function buildNpcIcon(){(D.npc||[]).forEach(function(N){if(N.i!==undefined&&N.i>=0)npcIcon[N.n]=N.i;});}buildNpcIcon();
-var showIcons=true,showPoi=true,showLab=false,showNpc=true,showPl=true,follow=true;
+var showIcons=true,showPoi=true,showLab=false,npcMode=2,showPl=true,follow=true;
 var cx=D.W/2,cz=D.H/2,Z=4,W=0,Hh=0,hits=[];
 function clamp(v,a,b){return Math.max(a,Math.min(v,b));}
 /* Render-on-demand: coalesce every change into a single rAF render instead of redrawing
@@ -2043,11 +2407,16 @@ var sig=[cx,cz,Z,W,Hh,showIcons,showPoi,showLab,nameVer,dataVer].join(",");
 if(sig!==baseSig){buildBase();baseSig=sig;}
 ctx.clearRect(0,0,W,Hh);ctx.drawImage(base,0,0);hits=baseHits.slice();
 var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);
-if(showNpc&&D.npc){for(var ni=0;ni<D.npc.length;ni++){var N=D.npc[ni];var nx=(N.x+0.5-sl)*Z,ny=(N.z+0.5-st)*Z;if(nx<-20||nx>W+20||ny<-20||ny>Hh+20)continue;
-var nii=(N.i!==undefined&&N.i>=0)?N.i:(npcIcon[N.n]!==undefined?npcIcon[N.n]:-1);var nsc=nii>=0?shadowed(nii):null;var nhr;
+function drawNpc(N,alpha,tag){var nx=(N.x+0.5-sl)*Z,ny=(N.z+0.5-st)*Z;if(nx<-20||nx>W+20||ny<-20||ny>Hh+20)return;
+var nii=(N.i!==undefined&&N.i>=0)?N.i:(npcIcon[N.n]!==undefined?npcIcon[N.n]:-1);var nsc=nii>=0?shadowed(nii):null;var nhr;ctx.globalAlpha=alpha;
 if(nsc){var nim=ICONS[nii];var nsz=clamp(Z*2.6,20,44);var nk=nsz/nim.naturalWidth,ndw=nsc.width*nk,ndh=nsc.height*nk;ctx.drawImage(nsc,nx-ndw/2,ny-ndh/2,ndw,ndh);nhr=nsz/2;}
-else{ctx.fillStyle="#f1c40f";ctx.strokeStyle="rgba(0,0,0,.6)";ctx.lineWidth=1;ctx.beginPath();ctx.arc(nx,ny,4,0,6.28);ctx.fill();ctx.stroke();nhr=5;}
-hits.push({sx:nx,sy:ny,r:nhr,n:N.n+(N.l?" (lv "+N.l+")":""),s:"NPC - "+N.x+","+N.z});}}
+else{ctx.fillStyle=tag==="live"?"#f1c40f":"#9aa0a6";ctx.strokeStyle="rgba(0,0,0,.6)";ctx.lineWidth=1;ctx.beginPath();ctx.arc(nx,ny,4,0,6.28);ctx.fill();ctx.stroke();nhr=5;}
+ctx.globalAlpha=1;hits.push({sx:nx,sy:ny,r:nhr,n:N.n+(N.l?" (lv "+N.l+")":"")+(tag==="stored"?" · last seen":""),s:"NPC - "+N.x+","+N.z});}
+if(npcMode>0){
+if(npcMode===1){var SN=D.ns||[];for(var si=0;si<SN.length;si++)drawNpc(SN[si],0.85,"stored");}
+else{var LV=D.npc||[],SN2=D.ns||[];
+for(var si2=0;si2<SN2.length;si2++){var S=SN2[si2],near=false;for(var li=0;li<LV.length;li++){var ddx=LV[li].x-S.x,ddz=LV[li].z-S.z;if(ddx*ddx+ddz*ddz<=16){near=true;break;}}if(!near)drawNpc(S,0.5,"stored");}
+for(var li2=0;li2<LV.length;li2++)drawNpc(LV[li2],1,"live");}}
 if(showPl&&D.pl){for(var pl2=0;pl2<D.pl.length;pl2++){var L=D.pl[pl2];var lx=(L.x+0.5-sl)*Z,ly=(L.z+0.5-st)*Z;if(lx<-10||lx>W+10||ly<-10||ly>Hh+10)continue;ctx.fillStyle="#2ecc71";ctx.strokeStyle="#fff";ctx.lineWidth=1;ctx.beginPath();ctx.arc(lx,ly,4,0,6.28);ctx.fill();ctx.stroke();hits.push({sx:lx,sy:ly,r:5,n:L.n,s:"Player - "+L.x+","+L.z});}}
 if(D.dest){var dsx=(D.dest.x+0.5-sl)*Z,dsy=(D.dest.z+0.5-st)*Z;drawDest(ctx,dsx,dsy);}
 if(D.p){var ppx=(D.p.x+0.5-sl)*Z,ppy=(D.p.z+0.5-st)*Z;ctx.save();ctx.fillStyle="#19b9ff";ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.beginPath();ctx.arc(ppx,ppy,6,0,6.28);ctx.fill();ctx.stroke();ctx.restore();}}
@@ -2073,12 +2442,13 @@ var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)
 var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);var wx=sl+mx/Z,wz=st+my/Z;
 if(best){var m=best.s.match(/(-?\\d+),(-?\\d+)/);if(m){goTo(parseInt(m[1]),parseInt(m[2]));}}
 else if(D.online&&IPC){IPC.send("map-window:input",{t:"move",x:Math.round(wx),z:Math.round(wz)});}}
-view.addEventListener("mousedown",function(e){pressed=true;dragging=false;sx0=lx0=e.clientX;sy0=ly0=e.clientY;pressT=Date.now();});
+view.addEventListener("mousedown",function(e){if(e.button!==0)return;pressed=true;dragging=false;sx0=lx0=e.clientX;sy0=ly0=e.clientY;pressT=Date.now();});
 window.addEventListener("mouseup",function(e){if(pressed&&!dragging&&e.target&&(view===e.target||view.contains(e.target)))clickAt(e);pressed=false;dragging=false;view.classList.remove("drag");});
 view.addEventListener("mousemove",function(e){if(pressed){if(!dragging){var dist=Math.abs(e.clientX-sx0)+Math.abs(e.clientY-sy0);if((dist>DRAG_THRESH&&(Date.now()-pressT)>HOLD_MS)||dist>DRAG_THRESH*3){dragging=true;setFollow(false);view.classList.add("drag");}}if(dragging){cx-=(e.clientX-lx0)/Z;cz-=(e.clientY-ly0)/Z;lx0=e.clientX;ly0=e.clientY;requestRender();tip.style.display="none";}return;}
 var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top,best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}
 if(best){tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+10)+"px";tip.innerHTML="<b>"+best.n+"</b><br>"+best.s;}else tip.style.display="none";});
 view.addEventListener("wheel",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var f=e.deltaY<0?1.15:1/1.15;Z=clamp(Z*f,0.3,48);cx=wx+W/(2*Z)-mx/Z;cz=wz+Hh/(2*Z)-my/Z;render();},{passive:false});
+view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){if(!m.contains(ev.target)){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});
 function setFollow(on){follow=on&&!!D.online;var b=document.getElementById("follow");b.className="btn"+(D.online?"":" dis")+(follow?"":" off");b.innerText=(follow?"◉":"○")+" Follow";if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;render();}}
 document.getElementById("follow").onclick=function(){if(!D.online)return;setFollow(!follow);};
 document.getElementById("fdown").onclick=function(){if(IPC)IPC.send("map-window:input",{t:"floor",f:(D.floor||0)-1});};
@@ -2086,7 +2456,8 @@ document.getElementById("fup").onclick=function(){if(IPC)IPC.send("map-window:in
 document.getElementById("close").onclick=function(){if(IPC)IPC.send("map-window:close");};
 document.getElementById("L_ic").onchange=function(e){showIcons=e.target.checked;render();};
 document.getElementById("L_poi").onchange=function(e){showPoi=e.target.checked;render();};
-document.getElementById("L_npc").onchange=function(e){showNpc=e.target.checked;render();};
+var NPCLBL=["Off","Stored","Live"];function setNpcMode(m){npcMode=((m%3)+3)%3;var el=document.getElementById("npcmodelbl");if(el)el.textContent=NPCLBL[npcMode];requestRender();}
+document.getElementById("npcmode").onclick=function(){setNpcMode(npcMode+1);};setNpcMode(2);
 document.getElementById("L_pl").onchange=function(e){showPl=e.target.checked;render();};
 document.getElementById("L_lab").onchange=function(e){showLab=e.target.checked;render();};
 q.oninput=function(){var s=q.value.trim().toLowerCase();if(!s)return;var best=null,bd=1e9;function consider(x,z,n){if(n.toLowerCase().indexOf(s)<0)return;var d=(x-cx)*(x-cx)+(z-cz)*(z-cz);if(d<bd){bd=d;best=[x,z];}}D.ob.forEach(function(o){consider(o.x,o.z,o.n+" "+o.c);});(D.npc||[]).forEach(function(N){consider(N.x,N.z,N.n);});D.pi.forEach(function(P){consider(P.x,P.z,P.n);});if(best)goTo(best[0],best[1]);};
@@ -2108,7 +2479,7 @@ if(IPC&&IPC.on){IPC.on("map-window:update",function(e,u){if(!u)return;
 if(u.full){var nd=u.full;D=nd;loadImgs();taxState();buildNpcIcon();buildCats();setLabel();dataVer++;}
 if(u.p!==undefined)D.p=u.p;if(u.npc!==undefined)D.npc=u.npc;if(u.pl!==undefined)D.pl=u.pl;if(u.online!==undefined)D.online=u.online;
 if(u.dest!==undefined){var had=!!D.dest;D.dest=u.dest;if(D.dest&&!had)destT0=performance.now();}
-setFollow(follow);if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;}ensureDestAnim();requestRender();});}
+setFollow(follow);if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;}if(u.goTo){setFollow(false);goTo(u.goTo.x,u.goTo.z);}ensureDestAnim();requestRender();});}
 buildCats();setLabel();setFollow(true);ensureDestAnim();
 window.addEventListener("resize",resize);[terrain].concat(ICONS,MM).forEach(function(im){im.addEventListener("load",requestRender);});setTimeout(render,300);setTimeout(render,1200);
 resize();fit();})();</script></body></html>`;
@@ -2137,6 +2508,10 @@ resize();fit();})();</script></body></html>`;
     /** Build-committed cache of rendered model icons, via the generic core asset
      *  cache (main-process file under data/world-map-icons.json). */
     private iconCacheStore = new PluginAssetCache('world-map-icons');
+    /** Build-committed prebake of explored terrain (per map+floor), via the same core
+     *  asset cache (data/world-map-terrain.json). Packaged users load a full map up
+     *  front; in dev it re-bakes as you explore so the shipped cache can be updated. */
+    private terrainCacheStore = new PluginAssetCache('world-map-terrain');
     private iconFailed = new Set<string>();
     private iconPending = new Set<string>();
     private iconQueue: { key: string; file: string }[] = [];
@@ -2234,14 +2609,13 @@ resize();fit();})();</script></body></html>`;
         this.objModelFiles = new Map();
         this.npcModelFiles = new Map();
         const src: string = (window as any).__eqSourceCode || '';
-        for (const m of src.matchAll(/\{defId:(\d+),files:\[([^\]]*)\]/g)) {
+        for (const m of src.matchAll(/(?:\bdefId\s*:\s*|['"]?id['"]?\s*:\s*)(\d+)[^}]*?(?:file|files|model|modelPath|assetId)['"]?\s*:\s*(?:\[\s*)?['"]([^'"]+\.(?:glb|gltf))['"]/gi)) {
             const id = Number(m[1]);
-            const first = (m[2].match(/"([^"]+\.glb)"/i) || [])[1];
-            if (first && !this.objModelFiles.has(id)) this.objModelFiles.set(id, first);
+            if (!this.objModelFiles.has(id)) this.objModelFiles.set(id, m[2]);
         }
-        // NPC model table (`pp`): most use `file:"…glb"`, but some (e.g. skeleton #5)
-        // use `modelPath:"…glb"`. Humanoid NPCs have NEITHER (assembled from equipment).
-        for (const m of src.matchAll(/(\d+):\{[^{}]*?(?:file|modelPath):"([^"]+\.glb)"/gi)) {
+        // NPC model table (`pp`): robust negative lookahead to find the FIRST .glb within an NPC block.
+        // It prevents crossing into the next NPC definition (`\d+:{`) while allowing nested braces.
+        for (const m of src.matchAll(/(\d+)\s*:\s*\{(?:(?!\d+\s*:\s*\{)[\s\S])*?['"]([^'"]+\.(?:glb|gltf))['"]/gi)) {
             const id = Number(m[1]);
             if (!this.npcModelFiles.has(id)) this.npcModelFiles.set(id, m[2]);
         }
@@ -2266,7 +2640,7 @@ resize();fit();})();</script></body></html>`;
      *  names + nested arrays/objects, so it survives EvilQuest renaming fields). */
     private findGlb(def: any, depth = 0): string | null {
         if (!def || typeof def !== 'object' || depth > 2) return null;
-        const isGlb = (s: any) => typeof s === 'string' && /\.glb(\?|#|$)/i.test(s);
+        const isGlb = (s: any) => typeof s === 'string' && WorldMapPlugin.MODEL_EXT.test(s);
         // Prefer direct string fields first (model/file/files), then descend.
         for (const v of Object.values(def)) if (isGlb(v)) return v as string;
         for (const v of Object.values(def)) {
@@ -2304,7 +2678,7 @@ resize();fit();})();</script></body></html>`;
         // frame, including during the async icon-system init before parseModelTables ran).
         if (!table) return null;
         const file = this.findGlb(def) ?? table.get(defId) ?? null;
-        this.modelFileCache.set(key, file);
+        if (file) this.modelFileCache.set(key, file);
         return file;
     }
 
@@ -2401,10 +2775,15 @@ resize();fit();})();</script></body></html>`;
         }
         return typeof a === 'string' ? a : '';
     }
+    /** Model file extensions Babylon's loader can import for our icons. The game's
+     *  bought-asset packs (e.g. Medieval_Dracula: Lamp, Coffin, Notice Board) ship as
+     *  .gltf, not .glb — accept both or those objects fall back to plain dots. */
+    private static readonly MODEL_EXT = /\.(glb|gltf)(\?|#|$)/i;
+
     private objAssetFile(assetId: string): string | null {
         if (!assetId) return null;
         const path = this.getAssetRegistry()?.get(assetId)?.path;
-        if (typeof path !== 'string' || !/\.glb(\?|#|$)/i.test(path)) return null;
+        if (typeof path !== 'string' || !WorldMapPlugin.MODEL_EXT.test(path)) return null;
         // Force origin-absolute so it resolves against the site root, not our
         // /__evillite__/client.html document base (registry paths may be bare).
         return /^https?:/i.test(path) || path.startsWith('/') ? path : '/' + path;
@@ -2481,9 +2860,22 @@ resize();fit();})();</script></body></html>`;
     private getNpcIcon(defId: number): HTMLImageElement | null {
         const file = this.modelFileFor('npc', defId);
         if (file) return this.iconFor('npc:' + defId, () => file);
-        // No specific model, but the def IS loaded → it's a humanoid: shared body icon.
+
+        // modelFileFor returned null. Before falling back to the humanoid icon, check
+        // whether the NPC model tables (regex-parsed at init) say this defId HAS a model.
+        // If so, modelFileFor just hasn't resolved it yet (def still streaming in from
+        // the network) — return null (clean dot) instead of the wrong humanoid icon.
+        if (this.npcModelFiles?.has(defId)) return null;
+
+        // Also check the live def: if findGlb can extract a .glb from the live def object
+        // right now (even though modelFileFor missed it — e.g. due to cache miss), use it.
         const def = this.gm?.entities?.npcDefsCache?.get(defId);
-        if (def) return this.iconFor('npc:__humanoid__', () => WorldMapPlugin.HUMANOID_MODEL);
+        if (def) {
+            const glb = this.findGlb(def);
+            if (glb) return this.iconFor('npc:' + defId, () => glb);
+            // Def loaded AND no .glb anywhere → genuinely a humanoid NPC.
+            return this.iconFor('npc:__humanoid__', () => WorldMapPlugin.HUMANOID_MODEL);
+        }
         return null;
     }
 
@@ -2531,7 +2923,7 @@ resize();fit();})();</script></body></html>`;
             if (reg && typeof (reg as any).forEach === 'function') {
                 (reg as any).forEach((entry: any, assetId: any) => {
                     const path = entry?.path;
-                    if (typeof assetId === 'string' && typeof path === 'string' && /\.glb(\?|#|$)/i.test(path)) {
+                    if (typeof assetId === 'string' && typeof path === 'string' && WorldMapPlugin.MODEL_EXT.test(path)) {
                         add('obj:' + assetId, this.objAssetFile(assetId) ?? path);
                     }
                 });
@@ -2787,7 +3179,12 @@ resize();fit();})();</script></body></html>`;
                 ctx.restore();
                 ctx.drawImage(img, sx - u / 2, sy - u / 2, u, u);
             } else {
-                this.drawStar(ctx, sx, sy, 7, m.color);
+                ctx.save();
+                ctx.fillStyle = m.color || '#ffff00';
+                ctx.beginPath();
+                ctx.arc(sx, sy, 4, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
             }
 
             const hitRadius = (img && img.complete && img.naturalWidth > 0) ? u / 2 : 9;
@@ -2865,33 +3262,27 @@ resize();fit();})();</script></body></html>`;
         // 1) NPC sightings (faded), under everything — now with the creature's icon
         //    (or person glyph for humanoids), falling back to a dot.
         if (this.showNpcSightings) {
-            for (const [defId, m] of this.npcStore) {
-                const first = m.values().next().value;
-                const name = first?.name ?? '';
-                if (this.disabledNames.has(`${WorldMapPlugin.NPC_CAT}:${name}`) || this.disabledCats.has(WorldMapPlugin.NPC_CAT)) continue;
-                if (q && !name.toLowerCase().includes(q)) continue;
+            const sightings = this.buildNpcSightings(this.currentFloor, (defId) => defId);
+            for (const s of sightings) {
+                if (q && !s.n.toLowerCase().includes(q)) continue;
+                const defId = s.i; // We mapped iconIdxOf to just return defId
                 const icon = this.getNpcIcon(defId);                 // also queues the render
                 const modelless = !icon && this.isModelless('npc', defId);
                 const useIcon = icon && z >= 2.5;                    // dots when zoomed far (perf)
                 const sz = Math.max(11, Math.min(z * 1.6, 24));
                 ctx.fillStyle = 'rgba(255,90,90,0.28)';
-                for (const s of m.values()) {
-                    // Skip if there is a live NPC of this def right here (avoid double).
-                    if (this.liveNpcKeys.has(`${defId}:${s.x},${s.z}`)) continue;
-                    if ((s as any).floor !== undefined && (s as any).floor !== this.currentFloor) continue;
-                    const sx = (s.x + 0.5 - srcLeft) * z, sy = (s.z + 0.5 - srcTop) * z;
-                    if (!inView(sx, sy)) continue;
-                    if (useIcon) this.drawIcon(ctx, icon!, sx, sy, sz, 0.5);
-                    else if (modelless && z >= 2.5) this.drawPerson(ctx, sx, sy, Math.max(3, baseR * 0.7), '#f0a060', 0.5);
-                    else { ctx.beginPath(); ctx.arc(sx, sy, Math.max(2, baseR * 0.5), 0, Math.PI * 2); ctx.fill(); }
-                }
+                const sx = (s.x + 0.5 - srcLeft) * z, sy = (s.z + 0.5 - srcTop) * z;
+                if (!inView(sx, sy)) continue;
+                if (useIcon) this.drawIcon(ctx, icon!, sx, sy, sz, 0.5);
+                else { ctx.beginPath(); ctx.arc(sx, sy, Math.max(2, baseR * 0.5), 0, Math.PI * 2); ctx.fill(); }
             }
         }
 
         // 2) Objects — grouped per tile so stacked objects don't fight: one marker per
         //    tile at its exact coordinate, with a count badge when several share it.
         const tileGroups = new Map<string, MapObject[]>();
-        for (const o of this.objectStore.values()) {
+        const allObjects = [...this.objectStore.values(), ...this.liveEphemeral];
+        for (const o of allObjects) {
             if (o.floor !== undefined && o.floor !== this.currentFloor) continue;
             if (!this.nameEnabled(o.category, o.name)) continue;
             if (q && !(o.name.toLowerCase().includes(q) || o.category.toLowerCase().includes(q))) continue;
@@ -2949,13 +3340,13 @@ resize();fit();})();</script></body></html>`;
                     // Mobile creatures: just the model, NO ring (rings are for static nodes).
                     this.drawIcon(ctx, icon, sx, sy, s, 1);
                     hitR = s / 2;
-                } else if (this.isModelless('npc', n.defId)) {
-                    // Humanoid NPC (no standalone model — assembled from equipment):
-                    // a clean person silhouette instead of a 3D thumbnail.
-                    this.drawPerson(ctx, sx, sy, baseR + 1, '#f0a060', 1);
                 } else {
-                    // Animal whose model just hasn't finished rendering yet.
-                    this.drawShape(ctx, 'triangle', sx, sy, baseR + 1, '#ff5555', 1);
+                    // While loading, just draw a clean dot (matches minimap style).
+                    // No messy fallback shapes that cause "wrong model" flashing!
+                    ctx.fillStyle = n.name.includes('Demon') ? '#f25' : '#0f4';
+                    ctx.beginPath();
+                    ctx.arc(sx, sy, Math.max(3, baseR * 0.8), 0, Math.PI * 2);
+                    ctx.fill();
                 }
                 this.hitTargets.push({ sx, sy, r: hitR, label: this.prettify(n.name), sub: `NPC${n.level != null ? ` • lvl ${n.level}` : ''} • ${Math.round(n.x)},${Math.round(n.z)}`, wx: n.x, wz: n.z });
                 if (showLabels) labelOnce(`${this.prettify(n.name)}${n.level != null ? ` (${n.level})` : ''}`, sx, sy - hitR - 3);
