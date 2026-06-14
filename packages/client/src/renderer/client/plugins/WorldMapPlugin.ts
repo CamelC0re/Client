@@ -271,6 +271,25 @@ export default class WorldMapPlugin extends Plugin {
         this.createMapOverlay();
         this.installKeyHandler();
         this.registerSidebarIcon();
+        this.warmUp();
+    }
+
+    private warmedUp = false;
+    /** Pre-load the icon system + map data in the background once the player is in-world, so
+     *  the first time the map opens it's already populated — instead of showing placeholder
+     *  dots for a moment while the prebaked icon cache loads and the world canvas builds. */
+    private async warmUp(attempt = 0): Promise<void> {
+        if (this.warmedUp || !this.isStarted) return;
+        const cm = this.getChunkManager();
+        if (!cm || !this.gm?.scene) { if (attempt < 90) setTimeout(() => this.warmUp(attempt + 1), 1000); return; }
+        this.warmedUp = true;
+        try {
+            await this.initIconSystem();   // load prebaked icon cache + Babylon -> bjsState ready
+            this.refreshData();            // populate objectStore / markers / NPCs (queues icon renders)
+            this.rebuildWorldCanvas(cm);   // build terrain + walls
+            setTimeout(() => this.refreshData(), 1500); // settle pass for late-streaming defs
+            this.info('warm-up complete — map ready to open instantly.');
+        } catch { /* best effort */ }
     }
 
     stop() {
@@ -286,6 +305,7 @@ export default class WorldMapPlugin extends Plugin {
             this.mapOverlay = null;
         }
         this.unregisterSidebarIcon();
+        this.warmedUp = false;
     }
 
     /** Add a map icon to the plugin sidebar (highlite_bar). Clicking it toggles the map
@@ -1699,11 +1719,17 @@ export default class WorldMapPlugin extends Plugin {
             .map((n) => ({ x: n.x, z: n.z, n: this.prettify(n.name), l: n.level ?? 0, i: idxOf(this.getNpcIcon(n.defId)) }));
         const pl = this.players.map((p) => ({ x: p.x, z: p.z, n: p.name }));
 
+        // Sparse wall list [x,z,wf,...] (wf = N|E|S|W bitmask) so the viewer can draw the
+        // vanilla white wall lines at screen scale, exactly like the in-game minimap.
+        const wl: number[] = [];
+        const ww = this.worldWalls;
+        for (let z2 = 0; z2 < H; z2++) { const row = z2 * W; for (let x2 = 0; x2 < W; x2++) { const wf = ww[row + x2]; if (wf) wl.push(x2, z2, wf); } }
+
         const player = this.getPlayerPos();
         return {
             id: this.mapId || 'world', W, H, t: terrain, ic: icons, ob: objects, ct: cats, pi: pois, mm: mmIcons,
             floor: this.currentFloor, p: player ? { x: player.x, z: player.z } : null,
-            npc, pl, online: !!player, dest: this.getMoveDest(),
+            npc, pl, wl, online: !!player, dest: this.getMoveDest(),
         };
     }
 
@@ -1836,6 +1862,7 @@ export default class WorldMapPlugin extends Plugin {
 + 'function render(){if(!W)return;hits=[];ctx.fillStyle="#0a0a0a";ctx.fillRect(0,0,W,Hh);'
 + 'var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);'
 + 'if(terrain.complete&&terrain.naturalWidth){ctx.imageSmoothingEnabled=true;ctx.save();ctx.translate(-sl*Z,-st*Z);ctx.scale(Z,Z);ctx.drawImage(terrain,0,0);ctx.restore();}'
++ 'if(D.wl&&D.wl.length){ctx.fillStyle="rgb(220,216,200)";var wt=Math.max(1.5,Z*0.15);for(var wi=0;wi<D.wl.length;wi+=3){var wx=D.wl[wi],wz=D.wl[wi+1],wf=D.wl[wi+2];var wsx=(wx-sl)*Z,wsy=(wz-st)*Z;if(wsx<-Z||wsx>W+Z||wsy<-Z||wsy>Hh+Z)continue;if(wf&1)ctx.fillRect(wsx,wsy,Z,wt);if(wf&4)ctx.fillRect(wsx,wsy+Z-wt,Z,wt);if(wf&8)ctx.fillRect(wsx,wsy,wt,Z);if(wf&2)ctx.fillRect(wsx+Z-wt,wsy,wt,Z);}}'
 + 'if(showIcons){for(var j=0;j<D.ob.length;j++){var o=D.ob[j];if(nameOn[o.c+"|"+o.n]===false)continue;var sx=(o.x+0.5-sl)*Z,sy=(o.z+0.5-st)*Z;if(sx<-30||sx>W+30||sy<-30||sy>Hh+30)continue;'
 + 'var hr;var sc=o.i>=0?shadowed(o.i):null;if(sc){var iim=ICONS[o.i];var sz=clamp(Z*3,24,50);var k=sz/iim.naturalWidth,dw=sc.width*k,dh=sc.height*k;ctx.globalAlpha=o.d?0.45:1;ctx.drawImage(sc,sx-dw/2,sy-dh/2,dw,dh);ctx.globalAlpha=1;hr=sz/2;}'
 + 'else{var col=(D.ct.filter(function(c){return c.n==o.c;})[0]||{c:"#ffd24a"}).c;var br=clamp(Z*0.55,3,9);ctx.fillStyle=col;ctx.globalAlpha=o.d?0.4:1;ctx.beginPath();ctx.arc(sx,sy,br,0,6.28);ctx.fill();ctx.globalAlpha=1;hr=br;}'
@@ -1955,6 +1982,7 @@ var base=document.createElement("canvas"),bctx=base.getContext("2d"),baseHits=[]
 function buildBase(){base.width=W;base.height=Hh;bctx.clearRect(0,0,W,Hh);baseHits=[];
 var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);
 if(terrain.complete&&terrain.naturalWidth){bctx.imageSmoothingEnabled=true;bctx.save();bctx.translate(-sl*Z,-st*Z);bctx.scale(Z,Z);bctx.drawImage(terrain,0,0);bctx.restore();}
+if(D.wl&&D.wl.length){bctx.fillStyle="rgb(220,216,200)";var wt=Math.max(1.5,Z*0.15);for(var wi=0;wi<D.wl.length;wi+=3){var wx=D.wl[wi],wz=D.wl[wi+1],wf=D.wl[wi+2];var wsx=(wx-sl)*Z,wsy=(wz-st)*Z;if(wsx<-Z||wsx>W+Z||wsy<-Z||wsy>Hh+Z)continue;if(wf&1)bctx.fillRect(wsx,wsy,Z,wt);if(wf&4)bctx.fillRect(wsx,wsy+Z-wt,Z,wt);if(wf&8)bctx.fillRect(wsx,wsy,wt,Z);if(wf&2)bctx.fillRect(wsx+Z-wt,wsy,wt,Z);}}
 if(showIcons){for(var j=0;j<D.ob.length;j++){var o=D.ob[j];if(nameOn[o.c+"|"+o.n]===false)continue;var sx=(o.x+0.5-sl)*Z,sy=(o.z+0.5-st)*Z;if(sx<-30||sx>W+30||sy<-30||sy>Hh+30)continue;
 var hr;var sc=o.i>=0?shadowed(o.i):null;if(sc){var im=ICONS[o.i];var sz=clamp(Z*3,24,50);var k=sz/im.naturalWidth,dw=sc.width*k,dh=sc.height*k;bctx.globalAlpha=o.d?0.45:1;bctx.drawImage(sc,sx-dw/2,sy-dh/2,dw,dh);bctx.globalAlpha=1;hr=sz/2;}
 else{var col=(D.ct.filter(function(c){return c.n==o.c;})[0]||{c:"#ffd24a"}).c;var br=clamp(Z*0.55,3,9);bctx.fillStyle=col;bctx.globalAlpha=o.d?0.4:1;bctx.beginPath();bctx.arc(sx,sy,br,0,6.28);bctx.fill();bctx.globalAlpha=1;hr=br;}
