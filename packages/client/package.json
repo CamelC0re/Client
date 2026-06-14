@@ -19,7 +19,8 @@
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "NO_SANDBOX=1 electron-vite dev",
-    "start": "NO_SANDBOX=1 electron-vite preview",
+    "start": "npm run build && NO_SANDBOX=1 electron-vite preview",
+    "preview": "NO_SANDBOX=1 electron-vite preview",
     "build": "electron-vite build && node scripts/copy-plugin-data.mjs",
     "build:unpack": "npm run build && electron-builder --dir",
     "build:win": "npm run build && electron-builder --win",
