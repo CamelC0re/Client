@@ -71,15 +71,6 @@ interface MinimapMarker {
     color: string;  // derived display colour
 }
 
-interface HitTarget {
-    sx: number;
-    sy: number;
-    r: number;
-    label: string;
-    sub: string;
-    wx: number;
-    wz: number;
-}
 
 export default class WorldMapPlugin extends Plugin {
     pluginName = 'World Map';
@@ -100,12 +91,7 @@ export default class WorldMapPlugin extends Plugin {
     };
 
     // ── DOM ─────────────────────────────────────────────────────────────────────
-    private mapOverlay: HTMLDivElement | null = null;
-    private mapCanvas: HTMLCanvasElement | null = null;
     private statusEl: HTMLDivElement | null = null;
-    private panelEl: HTMLDivElement | null = null;
-    private searchInput: HTMLInputElement | null = null;
-    private tooltipEl: HTMLDivElement | null = null;
 
     // ── Offscreen terrain canvas (1px per tile) ───────────────────────────────────
     private worldCanvas: HTMLCanvasElement | null = null;
@@ -120,7 +106,6 @@ export default class WorldMapPlugin extends Plugin {
     // Tracks live connectivity so we can self-heal the map on reconnect after an AFK kick.
     private wasOnline = false;
 
-    private renderInterval: any = null;
     private isStarted = false;
 
     // Plugin sidebar (highlite_bar) icon — added while the plugin is enabled, removed on
@@ -144,11 +129,6 @@ export default class WorldMapPlugin extends Plugin {
     private overlayMsgHooked = false;
 
     // ── View state (tile units) ───────────────────────────────────────────────────
-    private centerX = 0;
-    private centerZ = 0;
-    private zoom = 4;
-    private followPlayer = true;
-    private followBtn: HTMLButtonElement | null = null;
     private currentFloor = 0;
 
     // ── Discovered/accumulated data ───────────────────────────────────────────────
@@ -183,13 +163,7 @@ export default class WorldMapPlugin extends Plugin {
     private showPlayers = true;
     private labelsEnabled = true;
     private showMinimapMarkers = true;
-    private searchStr = '';
-    private panelSignature = '';
 
-    private hitTargets: HitTarget[] = [];
-    private hoverPos: { x: number; y: number } | null = null;
-    private floorLabelEl: HTMLSpanElement | null = null;
-    private floorControlsEl: HTMLDivElement | null = null;
 
     private static readonly NPC_CAT = '__npc__';
     private static readonly MAX_SIGHTINGS_PER_NPC = 240;
@@ -313,7 +287,6 @@ export default class WorldMapPlugin extends Plugin {
         if (this.isStarted) return;
         this.isStarted = true;
         this.info('World Map Plugin started.');
-        this.createMapOverlay();
         this.installKeyHandler();
         this.registerSidebarIcon();
         this.warmUp();
@@ -350,14 +323,8 @@ export default class WorldMapPlugin extends Plugin {
         this.isStarted = false;
         this.info('World Map Plugin stopped.');
         this.persistStores(true);
-        if (this.renderInterval) {
-            clearInterval(this.renderInterval);
-            this.renderInterval = null;
-        }
-        if (this.mapOverlay) {
-            this.mapOverlay.remove();
-            this.mapOverlay = null;
-        }
+        this.stopMapWindowUpdates();
+        if (this.overlayEl) this.closeOverlayHost();
         this.unregisterSidebarIcon();
         this.warmedUp = false;
     }
@@ -530,13 +497,6 @@ export default class WorldMapPlugin extends Plugin {
         // Keep probing object categories as their meshes load nearby (catches altar/rock/
         // bank/furnace that weren't loaded when the one-shot dump ran).
         this.probeNewObjectCategories();
-
-        // Rebuild the filter panel if the set of categories/names changed.
-        const sig = this.computePanelSignature();
-        if (sig !== this.panelSignature) {
-            this.panelSignature = sig;
-            this.buildPanel();
-        }
 
         if (this.storeDirty && now - this.lastSave > 4000) this.persistStores();
     }
@@ -929,186 +889,9 @@ export default class WorldMapPlugin extends Plugin {
         } catch { /* ignore */ }
     }
 
-    // ── Taxonomy helpers ──────────────────────────────────────────────────────────
-    /** category -> Map<name, count>, plus the NPC pseudo-category. */
-    private buildTaxonomy(): Map<string, Map<string, number>> {
-        const tax = new Map<string, Map<string, number>>();
-        const add = (cat: string, name: string) => {
-            let m = tax.get(cat);
-            if (!m) { m = new Map(); tax.set(cat, m); }
-            m.set(name, (m.get(name) ?? 0) + 1);
-        };
-        for (const o of this.objectStore.values()) add(o.category, o.name);
-        const npcNames = new Map<string, number>();
-        for (const m of this.npcStore.values()) {
-            const first = m.values().next().value;
-            if (first) npcNames.set(first.name, (npcNames.get(first.name) ?? 0) + m.size);
-        }
-        if (npcNames.size) tax.set(WorldMapPlugin.NPC_CAT, npcNames);
-        return tax;
-    }
-    private computePanelSignature(): string {
-        const tax = this.buildTaxonomy();
-        const parts: string[] = [];
-        for (const [cat, names] of [...tax].sort((a, b) => a[0].localeCompare(b[0]))) {
-            parts.push(cat + '(' + [...names.keys()].sort().join('|') + ')');
-        }
-        return parts.join(';');
-    }
 
-    private catEnabled(cat: string): boolean {
-        return !this.disabledCats.has(cat);
-    }
-    private nameEnabled(cat: string, name: string): boolean {
-        return this.catEnabled(cat) && !this.disabledNames.has(`${cat}:${name}`);
-    }
 
-    // ── Overlay UI ────────────────────────────────────────────────────────────────
-    private updateFloorLabel() {
-        if (this.floorLabelEl) {
-            this.floorLabelEl.innerText = `Floor ${this.currentFloor}`;
-        }
-    }
 
-    private createMapOverlay() {
-        if (this.mapOverlay) return;
-
-        this.mapOverlay = document.createElement('div');
-        Object.assign(this.mapOverlay.style, {
-            position: 'fixed', top: '6%', left: '6%', width: '88%', height: '88%',
-            // The container uses the game's own dark-stone tile (the same texture the vanilla
-            // UI panels/buttons use) instead of flat black, so the map window matches the
-            // rest of EvilQuest. A subtle dark overlay keeps the panel/header text readable.
-            // The tile is applied (rotated 90°) by applyContainerTexture once it loads.
-            backgroundColor: '#121212',
-            backgroundRepeat: 'repeat', backgroundSize: 'auto',
-            border: '2px solid var(--theme-border, #444)',
-            borderRadius: '8px', zIndex: '2147483647', display: 'none', flexDirection: 'column',
-            padding: '12px', boxSizing: 'border-box', fontFamily: 'Inter, sans-serif',
-        } as CSSStyleDeclaration);
-        this.applyContainerTexture(this.mapOverlay);
-        // A freshly built overlay has an empty filter panel; clear the cached signature so
-        // the next refresh repopulates it (otherwise an unchanged dataset skips the rebuild).
-        this.panelSignature = '';
-        this.mapOverlay.classList.add('highlite-ui');
-
-        // Header
-        const header = document.createElement('div');
-        Object.assign(header.style, { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px', color: '#fff', gap: '10px' } as CSSStyleDeclaration);
-
-        const title = document.createElement('h2');
-        title.innerText = 'World Map';
-        Object.assign(title.style, { margin: '0', fontSize: '18px', whiteSpace: 'nowrap' } as CSSStyleDeclaration);
-
-        this.searchInput = document.createElement('input');
-        this.searchInput.placeholder = 'Search objects & NPCs…';
-        Object.assign(this.searchInput.style, {
-            flex: '1', maxWidth: '320px', padding: '6px 10px', borderRadius: '4px',
-            border: '1px solid #555', background: '#1a1a1a', color: '#fff', fontSize: '13px',
-        } as CSSStyleDeclaration);
-        const jumpBtn = document.createElement('button');
-        jumpBtn.innerText = 'Jump';
-        this.styleButton(jumpBtn, '#2c3e50');
-        jumpBtn.title = 'Centre on the nearest search match (or press Enter)';
-        jumpBtn.onclick = () => this.jumpToNearestMatch();
-        // Jump only makes sense with a query — keep it disabled/dimmed until there's text.
-        const syncJump = () => { const on = !!this.searchStr; jumpBtn.disabled = !on; jumpBtn.style.opacity = on ? '1' : '0.4'; jumpBtn.style.cursor = on ? 'pointer' : 'default'; };
-        this.searchInput.oninput = () => { this.searchStr = this.searchInput!.value.trim().toLowerCase(); syncJump(); };
-        this.searchInput.onkeydown = (e) => { if (e.key === 'Enter') this.jumpToNearestMatch(); e.stopPropagation(); };
-        syncJump();
-
-        this.followBtn = document.createElement('button');
-        this.styleButton(this.followBtn, '#27ae60');
-        this.followBtn.onclick = () => this.setFollow(!this.followPlayer);
-        this.setFollow(this.followPlayer); // sync text + colour to current state
-
-        const closeBtn = document.createElement('button');
-        closeBtn.innerText = '✕';
-        this.styleButton(closeBtn, 'transparent');
-        Object.assign(closeBtn.style, { padding: '4px 9px', fontSize: '16px', lineHeight: '1', color: '#ccc' } as CSSStyleDeclaration);
-        closeBtn.title = 'Close (M)';
-        closeBtn.onmouseenter = () => { closeBtn.style.color = '#fff'; closeBtn.style.backgroundColor = 'var(--theme-danger, #e74c3c)'; };
-        closeBtn.onmouseleave = () => { closeBtn.style.color = '#ccc'; closeBtn.style.backgroundColor = 'transparent'; };
-        closeBtn.onclick = () => this.toggleMap(false);
-
-        // Compact floor stepper: ▾ [Floor n] ▴ grouped into one pill. Always visible so
-        // you can always see which floor you're on and step up/down between levels.
-        const styleFloorBtn = (b: HTMLButtonElement) => Object.assign(b.style, {
-            padding: '2px 7px', cursor: 'pointer', backgroundColor: 'transparent', border: 'none',
-            borderRadius: '4px', color: '#cfd6dc', fontSize: '12px', lineHeight: '1',
-        } as CSSStyleDeclaration);
-        const hoverFloorBtn = (b: HTMLButtonElement) => {
-            b.onmouseenter = () => { b.style.backgroundColor = '#3a4046'; };
-            b.onmouseleave = () => { b.style.backgroundColor = 'transparent'; };
-        };
-
-        const floorDownBtn = document.createElement('button');
-        floorDownBtn.innerText = '▾';
-        styleFloorBtn(floorDownBtn); hoverFloorBtn(floorDownBtn);
-        floorDownBtn.title = 'Floor down';
-        floorDownBtn.onclick = () => { this.setFollow(false); this.currentFloor--; this.worldCanvas = null; this.updateFloorLabel(); };
-
-        this.floorLabelEl = document.createElement('span');
-        Object.assign(this.floorLabelEl.style, { fontWeight: '600', minWidth: '50px', textAlign: 'center', userSelect: 'none', fontSize: '12px' } as CSSStyleDeclaration);
-
-        const floorUpBtn = document.createElement('button');
-        floorUpBtn.innerText = '▴';
-        styleFloorBtn(floorUpBtn); hoverFloorBtn(floorUpBtn);
-        floorUpBtn.title = 'Floor up';
-        floorUpBtn.onclick = () => { this.setFollow(false); this.currentFloor++; this.worldCanvas = null; this.updateFloorLabel(); };
-
-        this.floorControlsEl = document.createElement('div');
-        Object.assign(this.floorControlsEl.style, {
-            display: 'flex', alignItems: 'center', gap: '1px',
-            background: 'rgba(0,0,0,0.28)', borderRadius: '6px', padding: '2px 3px',
-        } as CSSStyleDeclaration);
-        this.floorControlsEl.append(floorDownBtn, this.floorLabelEl, floorUpBtn);
-        this.updateFloorLabel(); // set initial label text
-
-        const right = document.createElement('div');
-        Object.assign(right.style, { display: 'flex', gap: '8px', alignItems: 'center' } as CSSStyleDeclaration);
-        right.append(this.floorControlsEl, this.followBtn, closeBtn);
-        header.append(title, this.searchInput, jumpBtn, right);
-
-        // Full-width status strip below the header (never truncated).
-        this.statusEl = document.createElement('div');
-        Object.assign(this.statusEl.style, {
-            fontSize: '12px', opacity: '0.75', color: '#fff', margin: '2px 0 8px',
-            fontFamily: 'monospace', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-        } as CSSStyleDeclaration);
-
-        // Body: left filter panel + canvas
-        const body = document.createElement('div');
-        Object.assign(body.style, { flex: '1', display: 'flex', gap: '10px', minHeight: '0' } as CSSStyleDeclaration);
-
-        this.panelEl = document.createElement('div');
-        Object.assign(this.panelEl.style, {
-            width: '210px', minWidth: '210px', overflowY: 'auto', color: '#fff', fontSize: '13px',
-            background: '#141414', borderRadius: '6px', padding: '8px',
-        } as CSSStyleDeclaration);
-
-        const canvasWrap = document.createElement('div');
-        Object.assign(canvasWrap.style, { flex: '1', position: 'relative', minWidth: '0' } as CSSStyleDeclaration);
-
-        this.mapCanvas = document.createElement('canvas');
-        Object.assign(this.mapCanvas.style, {
-            width: '100%', height: '100%', backgroundColor: '#0a0a0a', borderRadius: '4px', cursor: 'grab',
-        } as CSSStyleDeclaration);
-
-        this.tooltipEl = document.createElement('div');
-        Object.assign(this.tooltipEl.style, {
-            position: 'absolute', display: 'none', pointerEvents: 'none', background: 'rgba(0,0,0,0.9)',
-            color: '#fff', border: '1px solid #555', borderRadius: '4px', padding: '4px 8px', fontSize: '12px',
-            whiteSpace: 'nowrap', zIndex: '10', transform: 'translate(8px, 8px)',
-        } as CSSStyleDeclaration);
-
-        canvasWrap.append(this.mapCanvas, this.tooltipEl);
-        body.append(this.panelEl, canvasWrap);
-        this.mapOverlay.append(header, this.statusEl, body);
-        document.body.appendChild(this.mapOverlay);
-
-        this.installCanvasControls();
-    }
 
     /** The game's dark-stone tile, rotated 90° (brick courses horizontal), as a data URL.
      *  Baked once in the game renderer (same-origin) so the detached map window — a file://
@@ -1136,189 +919,13 @@ export default class WorldMapPlugin extends Plugin {
         });
     }
 
-    /** Apply the rotated dark-stone tile to the map container (matching the vanilla UI). */
-    private applyContainerTexture(el: HTMLElement) {
-        const overlay = 'linear-gradient(rgba(15,12,10,0.30), rgba(15,12,10,0.45))';
-        const raw = 'https://evilquest.net/ui/stone-dark.png';
-        this.bakeStoneTexture().then((u) => { el.style.backgroundImage = `${overlay}, url("${u || raw}")`; });
-    }
 
-    private styleButton(btn: HTMLButtonElement, bg: string) {
-        Object.assign(btn.style, {
-            padding: '6px 14px', cursor: 'pointer', backgroundColor: bg, border: 'none',
-            borderRadius: '4px', color: '#fff', fontFamily: 'Inter, sans-serif', fontSize: '13px', whiteSpace: 'nowrap',
-        } as CSSStyleDeclaration);
-    }
 
-    private buildPanel() {
-        if (!this.panelEl) return;
-        const tax = this.buildTaxonomy();
-        this.panelEl.innerHTML = '';
-        this.legendSlots = []; // DOM rebuilt — drop stale slot references
 
-        // Global toggles row
-        const globals = document.createElement('div');
-        globals.style.marginBottom = '8px';
-        globals.append(
-            this.makeToggle('Model icons', this.iconsEnabled, (v) => { this.iconsEnabled = v; this.saveFilterState(); }, '#9b59b6'),
-            this.makeToggle('Text labels', this.labelsEnabled, (v) => { this.labelsEnabled = v; this.saveFilterState(); }, '#e0e0e0'),
-            this.makeToggle('Minimap markers', this.showMinimapMarkers, (v) => { this.showMinimapMarkers = v; this.saveFilterState(); }, '#ffd24a'),
-            this.makeToggle('Players', this.showPlayers, (v) => { this.showPlayers = v; this.saveFilterState(); }, '#5dd5ff'),
-            this.makeToggle('NPCs (live)', this.showLiveNpcs, (v) => { this.showLiveNpcs = v; this.saveFilterState(); }, '#ff5555'),
-            this.makeToggle('NPC sightings', this.showNpcSightings, (v) => { this.showNpcSightings = v; this.saveFilterState(); }, '#aa4444'),
-        );
-        this.panelEl.appendChild(globals);
 
-        const sep = document.createElement('div');
-        Object.assign(sep.style, { height: '1px', background: '#333', margin: '6px 0' } as CSSStyleDeclaration);
-        this.panelEl.appendChild(sep);
 
-        // Categories (NPC pseudo-category last)
-        const cats = [...tax.keys()].sort((a, b) => {
-            if (a === WorldMapPlugin.NPC_CAT) return 1;
-            if (b === WorldMapPlugin.NPC_CAT) return -1;
-            return a.localeCompare(b);
-        });
-        for (const cat of cats) {
-            const names = tax.get(cat)!;
-            const total = [...names.values()].reduce((a, b) => a + b, 0);
-            const isNpc = cat === WorldMapPlugin.NPC_CAT;
-            const catLabel = isNpc ? 'NPCs' : this.prettify(cat);
 
-            const row = document.createElement('div');
-            row.style.marginBottom = '2px';
 
-            const head = document.createElement('div');
-            Object.assign(head.style, { display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' } as CSSStyleDeclaration);
-
-            const cb = this.makeCheckbox(this.catEnabled(cat), (v) => {
-                if (v) this.disabledCats.delete(cat); else this.disabledCats.add(cat);
-                this.saveFilterState();
-            });
-            const swatch = this.makeLegendIcon(isNpc ? 'npc' : 'obj', cat, undefined, this.catColor(cat));
-            const lbl = document.createElement('span');
-            lbl.textContent = `${catLabel} (${total})`;
-            lbl.style.flex = '1';
-            const caret = document.createElement('span');
-            caret.textContent = '▸';
-            caret.style.opacity = '0.6';
-
-            const sub = document.createElement('div');
-            Object.assign(sub.style, { display: 'none', paddingLeft: '20px', marginTop: '2px' } as CSSStyleDeclaration);
-            const sortedNames = [...names.keys()].sort();
-            for (const nm of sortedNames) {
-                const nrow = document.createElement('div');
-                Object.assign(nrow.style, { display: 'flex', alignItems: 'center', gap: '6px' } as CSSStyleDeclaration);
-                const ncb = this.makeCheckbox(this.nameEnabled(cat, nm), (v) => {
-                    const k = `${cat}:${nm}`;
-                    if (v) this.disabledNames.delete(k); else this.disabledNames.add(k);
-                    this.saveFilterState();
-                });
-                const nicon = this.makeLegendIcon(isNpc ? 'npc' : 'obj', cat, nm, this.catColor(cat), 20);
-                const nlbl = document.createElement('span');
-                nlbl.textContent = `${this.prettify(nm)} (${names.get(nm)})`;
-                nrow.append(ncb, nicon, nlbl);
-                sub.appendChild(nrow);
-            }
-
-            const toggleExpand = () => { sub.style.display = sub.style.display === 'none' ? 'block' : 'none'; caret.textContent = sub.style.display === 'none' ? '▸' : '▾'; };
-            caret.onclick = toggleExpand;
-            lbl.onclick = toggleExpand;
-
-            head.append(cb, swatch, lbl, caret);
-            row.append(head, sub);
-            this.panelEl.appendChild(row);
-        }
-    }
-
-    /** A small icon holder for a legend row — starts as the colour swatch, then gets
-     *  its representative model icon swapped in by refreshLegendIcons() once rendered. */
-    private makeLegendIcon(kind: 'obj' | 'npc', cat: string, name: string | undefined, color: string, size = 24): HTMLElement {
-        const el = document.createElement('span');
-        Object.assign(el.style, {
-            width: `${size}px`, height: `${size}px`, minWidth: `${size}px`, borderRadius: '3px',
-            display: 'inline-block', backgroundColor: color, backgroundSize: 'contain',
-            backgroundRepeat: 'no-repeat', backgroundPosition: 'center', flex: '0 0 auto',
-        } as CSSStyleDeclaration);
-        this.legendSlots.push({ el, kind, cat, name });
-        return el;
-    }
-
-    /** A reusable person-silhouette icon (PNG) for humanoid NPC legend entries. */
-    private getPersonIcon(): HTMLImageElement {
-        if (this.personIcon) return this.personIcon;
-        const c = document.createElement('canvas');
-        c.width = 32; c.height = 32;
-        const cx = c.getContext('2d');
-        if (cx) this.drawPerson(cx, 16, 15, 11, '#f0a060', 1);
-        const img = new Image();
-        img.src = c.toDataURL('image/png');
-        this.personIcon = img;
-        return img;
-    }
-
-    private legendIconFor(kind: 'obj' | 'npc', cat: string, name?: string): HTMLImageElement | null {
-        if (kind === 'obj') {
-            if (name) {
-                const ready = this.nameRepIcon.get(cat + ' ' + name);
-                if (ready) return ready;
-                const sample = this.nameSampleObj.get(cat + ' ' + name);
-                if (sample) { const ic = this.getObjectIcon(sample); if (ic) return ic; } // queues a render
-                return this.catRepIcon.get(cat) ?? null;
-            }
-            const repReady = this.catRepIcon.get(cat);
-            if (repReady) return repReady;
-            const sample = this.catSampleObj.get(cat); // parent falls back to a child's icon
-            if (sample) return this.getObjectIcon(sample);
-            return null;
-        }
-        // NPC: a specific name → its model icon (or person glyph if humanoid);
-        // the parent NPC category → any ready animal icon, else the person glyph.
-        if (name) {
-            const defId = this.npcNameDef.get(name);
-            if (defId == null) return null;
-            const ic = this.getNpcIcon(defId);
-            if (ic) return ic;
-            if (this.isModelless('npc', defId)) return this.getPersonIcon();
-            return null;
-        }
-        for (const defId of this.npcNameDef.values()) {
-            const ic = this.iconCache.get('npc:' + defId);
-            if (ic && ic.complete && ic.naturalWidth > 0) return ic;
-        }
-        return this.getPersonIcon();
-    }
-
-    private refreshLegendIcons() {
-        for (const slot of this.legendSlots) {
-            const img = this.legendIconFor(slot.kind, slot.cat, slot.name);
-            if (!img || !img.complete || img.naturalWidth === 0) continue;
-            if (slot.el.dataset.iconSrc === img.src) continue;
-            slot.el.dataset.iconSrc = img.src;
-            slot.el.style.backgroundImage = `url(${img.src})`;
-            slot.el.style.backgroundColor = 'transparent';
-        }
-    }
-
-    private makeCheckbox(checked: boolean, onChange: (v: boolean) => void): HTMLInputElement {
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.checked = checked;
-        cb.style.cursor = 'pointer';
-        cb.onchange = () => onChange(cb.checked);
-        return cb;
-    }
-    private makeToggle(label: string, checked: boolean, onChange: (v: boolean) => void, color: string): HTMLDivElement {
-        const row = document.createElement('div');
-        Object.assign(row.style, { display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '2px' } as CSSStyleDeclaration);
-        const cb = this.makeCheckbox(checked, onChange);
-        const sw = document.createElement('span');
-        Object.assign(sw.style, { width: '10px', height: '10px', borderRadius: '50%', background: color, display: 'inline-block' } as CSSStyleDeclaration);
-        const l = document.createElement('span');
-        l.textContent = label;
-        row.append(cb, sw, l);
-        return row;
-    }
 
     private keyHandlerInstalled = false;
     private installKeyHandler() {
@@ -1342,186 +949,9 @@ export default class WorldMapPlugin extends Plugin {
         }, { capture: true });
     }
 
-    private installCanvasControls() {
-        const canvas = this.mapCanvas!;
 
-        canvas.addEventListener('wheel', (e) => {
-            e.preventDefault();
-            const factor = e.deltaY > 0 ? 0.85 : 1.18;
-            this.zoom = Math.max(0.5, Math.min(this.zoom * factor, 48));
-        });
 
-        let dragging = false, moved = false, lastX = 0, lastY = 0;
-        canvas.addEventListener('mousedown', (e) => {
-            if (e.button !== 0) return;
-            dragging = true; moved = false; lastX = e.clientX; lastY = e.clientY;
-            canvas.style.cursor = 'grabbing';
-        });
-        window.addEventListener('mouseup', () => { dragging = false; canvas.style.cursor = 'grab'; });
-        window.addEventListener('mousemove', (e) => {
-            if (dragging) {
-                const dx = e.clientX - lastX, dy = e.clientY - lastY;
-                if (Math.abs(dx) + Math.abs(dy) > 2) { moved = true; this.setFollow(false); }
-                lastX = e.clientX; lastY = e.clientY;
-                this.centerX -= dx / this.zoom;
-                this.centerZ -= dy / this.zoom;
-            }
-            // Track hover for tooltips (canvas-local coords).
-            const rect = canvas.getBoundingClientRect();
-            if (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
-                this.hoverPos = { x: e.clientX - rect.left, y: e.clientY - rect.top };
-            } else {
-                this.hoverPos = null;
-            }
-        });
-        // Click a marker -> centre on it, OR click ground -> walk there.
-        canvas.addEventListener('click', (e) => {
-            if (e.button !== 0 || moved || !this.hoverPos) return;
-            const hit = this.pickHit(this.hoverPos.x, this.hoverPos.y);
-            if (hit) { 
-                this.centerX = hit.wx; 
-                this.centerZ = hit.wz; 
-                
-                // Also update the UI button when we stop following
-                if (this.followPlayer) {
-                    this.setFollow(false);
-                    const btn = this.mapOverlay?.querySelector('button') as HTMLButtonElement;
-                    // The follow button is one of the buttons, we should ideally use the setFollow we created, but this works:
-                    const followBtn = [...(this.mapOverlay?.querySelectorAll('button') ?? [])].find(b => b.innerText.startsWith('Follow:'));
-                    if (followBtn) followBtn.innerText = 'Follow: OFF';
-                }
-            } else {
-                // Ground click -> walk there
-                const rect = canvas.getBoundingClientRect();
-                const z = this.zoom;
-                const dw = Math.max(1, Math.floor(rect.width));
-                const dh = Math.max(1, Math.floor(rect.height));
-                const srcLeft = this.centerX - dw / (2 * z);
-                const srcTop = this.centerZ - dh / (2 * z);
-                
-                let worldX = srcLeft + this.hoverPos.x / z;
-                let worldZ = srcTop + this.hoverPos.y / z;
-                
-                const player = this.getPlayerPos();
-                if (player) {
-                    const dx = worldX - player.x;
-                    const dz = worldZ - player.z;
-                    const dist = Math.sqrt(dx * dx + dz * dz);
-                    const MAX_OVERLAY_DIST = 80;
-                    if (dist > MAX_OVERLAY_DIST) {
-                        const ratio = MAX_OVERLAY_DIST / dist;
-                        worldX = player.x + dx * ratio;
-                        worldZ = player.z + dz * ratio;
-                    }
-                }
-                
-                if (this.gm?.minimap?.onClickMove) {
-                    this.gm.minimap.onClickMove(worldX, worldZ, worldX, worldZ);
-                }
-            }
-        });
 
-        // Right-click -> Context Menu
-        canvas.addEventListener('contextmenu', (e) => {
-            e.preventDefault();
-            if (!this.hoverPos) return;
-
-            const rect = canvas.getBoundingClientRect();
-            const z = this.zoom;
-            const dw = Math.max(1, Math.floor(rect.width));
-            const dh = Math.max(1, Math.floor(rect.height));
-            const srcLeft = this.centerX - dw / (2 * z);
-            const srcTop = this.centerZ - dh / (2 * z);
-            
-            const worldX = Math.round(srcLeft + this.hoverPos.x / z);
-            const worldZ = Math.round(srcTop + this.hoverPos.y / z);
-
-            let textToCopy = `(${worldX},${worldZ})`;
-            const hit = this.pickHit(this.hoverPos.x, this.hoverPos.y);
-            if (hit && hit.label) {
-                const cleanLabel = hit.label.split('\n')[0].trim();
-                textToCopy += `[${cleanLabel}]`;
-            }
-
-            this.showContextMenu(e.clientX, e.clientY, textToCopy);
-        });
-    }
-
-    private showContextMenu(x: number, y: number, textToCopy: string) {
-        let menu = document.getElementById('eq-map-context-menu');
-        if (menu) menu.remove();
-
-        menu = document.createElement('div');
-        menu.id = 'eq-map-context-menu';
-        Object.assign(menu.style, {
-            position: 'fixed', left: x + 'px', top: y + 'px',
-            background: '#473e32', border: '1px solid #1a1612', borderTopColor: '#72624d', borderLeftColor: '#72624d',
-            zIndex: '10000', boxShadow: '2px 2px 4px rgba(0,0,0,0.5)', userSelect: 'none', minWidth: '120px',
-            fontFamily: 'sans-serif'
-        });
-
-        const hdr = document.createElement('div');
-        Object.assign(hdr.style, {
-            background: '#362e24', padding: '4px 8px', borderBottom: '1px solid #1a1612',
-            color: '#ffd24a', fontWeight: 'bold', textAlign: 'center', fontSize: '12px', cursor: 'default'
-        });
-        hdr.textContent = 'Select an Option';
-        menu.appendChild(hdr);
-
-        const itm = document.createElement('div');
-        Object.assign(itm.style, {
-            padding: '6px 10px', cursor: 'pointer', color: '#fff', fontSize: '13px'
-        });
-        itm.textContent = `Share ${textToCopy}`;
-        itm.onmouseenter = () => itm.style.background = '#5c5040';
-        itm.onmouseleave = () => itm.style.background = 'transparent';
-        itm.onclick = (e) => {
-            e.stopPropagation();
-            menu!.remove();
-            
-            const chatInput = document.getElementById('chat-input') as HTMLInputElement;
-            if (chatInput) {
-                const currentVal = chatInput.value.trim();
-                chatInput.value = currentVal ? `${currentVal} ${textToCopy}` : textToCopy;
-                chatInput.focus();
-                this.toggleMap(false);
-            }
-        };
-        menu.appendChild(itm);
-        document.body.appendChild(menu);
-
-        const closeMenu = (e: MouseEvent) => {
-            if (!menu!.contains(e.target as Node)) {
-                menu!.remove();
-                window.removeEventListener('mousedown', closeMenu);
-            }
-        };
-        setTimeout(() => window.addEventListener('mousedown', closeMenu), 0);
-    }
-
-    private pickHit(x: number, y: number): HitTarget | null {
-        let best: HitTarget | null = null, bestD = Infinity;
-        for (const h of this.hitTargets) {
-            const d = (h.sx - x) ** 2 + (h.sy - y) ** 2;
-            const rr = (h.r + 4) ** 2;
-            if (d <= rr && d < bestD) { bestD = d; best = h; }
-        }
-        return best;
-    }
-
-    private toggleMap(show: boolean) {
-        if (!this.mapOverlay) return;
-        if (show) {
-            this.mapOverlay.style.display = 'flex';
-            this.setFollow(true);
-            this.refreshData();
-            this.startRenderLoop();
-        } else {
-            this.mapOverlay.style.display = 'none';
-            this.persistStores(true);
-            if (this.renderInterval) { clearInterval(this.renderInterval); this.renderInterval = null; }
-        }
-    }
 
     // ── Terrain rendering ─────────────────────────────────────────────────────────
     private static readonly T = { GRASS: 0, DIRT: 1, STONE: 2, WATER: 3, WALL: 4, SAND: 5, WOOD: 6, MUD: 7 };
@@ -1534,15 +964,8 @@ export default class WorldMapPlugin extends Plugin {
     private static readonly ROOF_COLOR = [96, 64, 34];       // Df — matches game exactly
     // Wall direction bitmask (F enum in the game): N=1, E=2, S=4, W=8 (Clockwise).
     // This aligns perfectly with the game's checks: (wf & 5) === 5 is N+S, (wf & 10) === 10 is E+W.
-    private static readonly WF = { N: 1, E: 2, S: 4, W: 8 };
     // Wall-edge line color — RGB(220,216,200): warm cream, same as game minimap white lines.
-    private static readonly WALL_LINE = [220, 216, 200];
 
-    private startRenderLoop() {
-        if (this.renderInterval) return;
-        this.renderInterval = setInterval(() => this.renderFrame(), 80);
-        this.renderFrame();
-    }
 
     private lastPaintedSize = -1;
     private lastRebuild = 0;
@@ -1830,115 +1253,6 @@ export default class WorldMapPlugin extends Plugin {
         return true;
     }
 
-    private renderFrame() {
-        if (!this.mapCanvas) return;
-        this.refreshData();
-
-        const cm = this.getChunkManager();
-        const display = this.mapCanvas;
-        const ctx = display.getContext('2d');
-        if (!ctx) return;
-
-        const rect = display.getBoundingClientRect();
-        const dw = Math.max(1, Math.floor(rect.width));
-        const dh = Math.max(1, Math.floor(rect.height));
-        if (display.width !== dw || display.height !== dh) { display.width = dw; display.height = dh; }
-
-        ctx.fillStyle = '#0a0a0a';
-        ctx.fillRect(0, 0, dw, dh);
-
-        if (!cm) { this.setStatus('Waiting for game… (log in to view the map)'); return; }
-
-        if (this.followPlayer && typeof cm.getCurrentFloor === 'function') {
-            const gmFloor = cm.getCurrentFloor();
-            if (this.currentFloor !== gmFloor) {
-                this.currentFloor = gmFloor;
-                this.worldCanvas = null; // force rebuild
-                this.updateFloorLabel();
-            }
-        }
-
-        const built = this.rebuildWorldCanvas(cm);
-        if (!built || !this.worldCanvas) { this.setStatus('Map data not loaded yet…'); return; }
-
-        const player = this.getPlayerPos();
-        if (this.followPlayer && player) { this.centerX = player.x; this.centerZ = player.z; }
-        else if (this.centerX === 0 && this.centerZ === 0) { this.centerX = this.worldW / 2; this.centerZ = this.worldH / 2; }
-
-        const z = this.zoom;
-        const srcLeft = this.centerX - dw / (2 * z);
-        const srcTop = this.centerZ - dh / (2 * z);
-
-        // The game's native minimap uses a custom Javascript bilinear interpolator to blend the
-        // calculated slope shading and coordinate noise across adjacent tiles. By enabling
-        // native hardware image smoothing here, the browser does the exact same bilinear
-        // filtering for us instantly when scaling the 1px-per-tile worldCanvas to the screen!
-        ctx.imageSmoothingEnabled = true;
-        ctx.save();
-        ctx.translate(-srcLeft * z, -srcTop * z);
-        ctx.scale(z, z);
-        ctx.drawImage(this.worldCanvas, 0, 0);
-        ctx.restore();
-
-        // Draw thin wall lines (properly scaled to screen)
-        ctx.fillStyle = `rgb(${WorldMapPlugin.WALL_LINE.join(',')})`;
-        const minX = Math.max(0, Math.floor(srcLeft));
-        const maxX = Math.min(this.worldW - 1, Math.ceil(srcLeft + dw / z));
-        const minZ = Math.max(0, Math.floor(srcTop));
-        const maxZ = Math.min(this.worldH - 1, Math.ceil(srcTop + dh / z));
-        const wt = Math.max(1.5, z * 0.15); // Thin but visible line thickness
-
-        for (let wz = minZ; wz <= maxZ; wz++) {
-            for (let wx = minX; wx <= maxX; wx++) {
-                const wf = this.worldWalls[wz * this.worldW + wx];
-                if (!wf) continue;
-                const sx = (wx - srcLeft) * z;
-                const sy = (wz - srcTop) * z;
-                if (wf & WorldMapPlugin.WF.N) ctx.fillRect(sx, sy, z, wt);
-                if (wf & WorldMapPlugin.WF.S) ctx.fillRect(sx, sy + z - wt, z, wt);
-                if (wf & WorldMapPlugin.WF.W) ctx.fillRect(sx, sy, wt, z);
-                if (wf & WorldMapPlugin.WF.E) ctx.fillRect(sx + z - wt, sy, wt, z);
-            }
-        }
-
-        // Markers (objects, NPC sightings, live NPCs, players, player).
-        this.drawMarkers(ctx, dw, dh, srcLeft, srcTop, z);
-
-        // Minimap markers (developer POIs — toggleable layer).
-        if (this.showMinimapMarkers) this.drawMinimapMarkers(ctx, dw, dh, srcLeft, srcTop, z);
-
-        const playerFloor = typeof cm.getCurrentFloor === 'function' ? cm.getCurrentFloor() : 0;
-        if (player && playerFloor === this.currentFloor) {
-            this.drawPlayerMarker(ctx, (player.x - srcLeft) * z, (player.z - srcTop) * z);
-        }
-
-        const minimap = this.gm?.minimap;
-        if (minimap && minimap.destX !== null && minimap.destZ !== null) {
-            // The destination marker is visible on whatever floor the player is on.
-            if (playerFloor === this.currentFloor) {
-                const dx = (minimap.destX - srcLeft) * z;
-                const dz = (minimap.destZ - srcTop) * z;
-                this.drawDestinationMarker(ctx, dx, dz, minimap.destAnimTime ?? 0);
-            }
-        }
-
-        // Hover tooltip.
-        this.updateTooltip();
-
-        // Keep the legend's parent/child icons in sync as models render in.
-        if (performance.now() - this.lastLegendRefresh > 400) {
-            this.lastLegendRefresh = performance.now();
-            this.refreshLegendIcons();
-        }
-
-        const objCount = this.objectStore.size;
-        let sightCount = 0; for (const m of this.npcStore.values()) sightCount += m.size;
-        const iconInfo = this.iconsEnabled
-            ? ` | icons:${this.bjsState}${this.bjsState === 'ready' ? ` ${this.iconCache.size}✓` : ''}${this.iconPending.size ? ` ${this.iconPending.size}…` : ''}${this.iconFailed.size ? ` ${this.iconFailed.size}✗` : ''} mdl:${this.objModelFiles?.size ?? 0}/${this.npcModelFiles?.size ?? 0}`
-            : '';
-        const diag = this.lastIconDiag ? `  ·  ${this.lastIconDiag}` : '';
-        this.setStatus(`obj:${objCount} seen:${sightCount} live:${this.liveNpcs.length} z:${z.toFixed(1)}x${iconInfo}${diag}`);
-    }
 
     // ── Map export (for the wiki: standalone interactive HTML the Hub can host + iframe) ─
     /**
@@ -2304,7 +1618,6 @@ export default class WorldMapPlugin extends Plugin {
             if (f !== this.currentFloor) {
                 this.currentFloor = f;
                 this.worldCanvas = null;
-                this.updateFloorLabel();
                 this.refreshData();
                 const snap = this.buildMapSnapshot();
                 if (snap) this.pushToViewer({ full: snap, p: snap.p });
@@ -2688,9 +2001,6 @@ resize();fit();})();</script></body></html>`;
     /** npc display name -> a defId, so legend rows can find/queue an icon. */
     private npcNameDef = new Map<string, number>();
     /** Legend icon holders to keep refreshed as icons render in. */
-    private legendSlots: { el: HTMLElement; kind: 'obj' | 'npc'; cat: string; name?: string }[] = [];
-    private personIcon: HTMLImageElement | null = null;
-    private lastLegendRefresh = 0;
     private objModelFiles: Map<number, string> | null = null;
     private npcModelFiles: Map<number, string> | null = null;
     /** Resolved model file per `${kind}:${defId}` (null = def loaded but has no .glb). */
@@ -3318,398 +2628,19 @@ resize();fit();})();</script></body></html>`;
         return img;
     }
 
-    // ── Minimap marker layer ──────────────────────────────────────────────────────
-    private drawMinimapMarkers(ctx: CanvasRenderingContext2D, dw: number, dh: number, srcLeft: number, srcTop: number, z: number) {
-        const pad = 20;
-        for (const m of this.minimapMarkers) {
-            if ((m as any).floor !== undefined && (m as any).floor !== this.currentFloor) continue;
-            const sx = (m.x - srcLeft) * z;
-            const sy = (m.z - srcTop) * z;
-            if (sx < -pad || sx > dw + pad || sy < -pad || sy > dh + pad) continue;
 
-            const u = Math.max(8, Math.min(32, m.size));
-            const img = this.getMmIcon(m.icon);
-            if (img && img.complete && img.naturalWidth > 0) {
-                // Game minimap uses the icon, plus it draws a subtle shadow/bg arc
-                ctx.save();
-                ctx.globalAlpha = 0.7;
-                ctx.fillStyle = "rgba(0, 0, 0, 0.68)";
-                ctx.beginPath();
-                ctx.arc(sx, sy, u * 0.55, 0, Math.PI * 2);
-                ctx.fill();
-                ctx.restore();
-                ctx.drawImage(img, sx - u / 2, sy - u / 2, u, u);
-            } else {
-                ctx.save();
-                ctx.fillStyle = m.color || '#ffff00';
-                ctx.beginPath();
-                ctx.arc(sx, sy, 4, 0, Math.PI * 2);
-                ctx.fill();
-                ctx.restore();
-            }
 
-            const hitRadius = (img && img.complete && img.naturalWidth > 0) ? u / 2 : 9;
-            this.hitTargets.push({ sx, sy, r: hitRadius, label: m.label || m.icon || 'Marker', sub: `Minimap marker • ${m.x},${m.z}`, wx: m.x, wz: m.z });
-        }
-    }
 
-    /** 5-pointed star marker for minimap POIs. */
-    private drawStar(ctx: CanvasRenderingContext2D, x: number, y: number, r: number, color: string) {
-        ctx.save();
-        ctx.fillStyle = color;
-        ctx.strokeStyle = 'rgba(0,0,0,0.75)';
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        for (let i = 0; i < 10; i++) {
-            const a = (i * Math.PI) / 5 - Math.PI / 2;
-            const d = i % 2 === 0 ? r : r * 0.42;
-            const px = x + Math.cos(a) * d, py = y + Math.sin(a) * d;
-            if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-        }
-        ctx.closePath();
-        ctx.fill();
-        ctx.stroke();
-        ctx.restore();
-    }
 
-    /** Small red count badge for tiles holding more than one object. */
-    private drawCountBadge(ctx: CanvasRenderingContext2D, x: number, y: number, r: number, n: number) {
-        const bx = x + r * 0.7, by = y - r * 0.7;
-        ctx.save();
-        ctx.beginPath();
-        ctx.arc(bx, by, 7, 0, Math.PI * 2);
-        ctx.fillStyle = '#c0392b';
-        ctx.fill();
-        ctx.lineWidth = 1;
-        ctx.strokeStyle = 'rgba(0,0,0,0.8)';
-        ctx.stroke();
-        ctx.fillStyle = '#fff';
-        ctx.font = 'bold 9px Inter, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(n > 9 ? '9+' : String(n), bx, by);
-        ctx.restore();
-    }
 
-    private drawIcon(ctx: CanvasRenderingContext2D, img: HTMLImageElement, x: number, y: number, size: number, alpha: number) {
-        ctx.save();
-        ctx.globalAlpha = alpha;
-        ctx.shadowColor = 'rgba(0,0,0,0.55)';
-        ctx.shadowBlur = 2;
-        ctx.drawImage(img, x - size / 2, y - size / 2, size, size);
-        ctx.restore();
-    }
 
-    private drawMarkers(ctx: CanvasRenderingContext2D, dw: number, dh: number, srcLeft: number, srcTop: number, z: number) {
-        this.hitTargets = [];
-        const pad = 16;
-        const baseR = Math.max(3, Math.min(z * 0.55, 9));
-        const showLabels = this.labelsEnabled && z >= 6;
-        const q = this.searchStr;
 
-        const inView = (sx: number, sy: number) => sx >= -pad && sx <= dw + pad && sy >= -pad && sy <= dh + pad;
 
-        // Label de-dup: skip a label if the SAME text is already drawn nearby, so dense
-        // fields (340 "Wheat Plant"s) don't turn into overlapping text soup.
-        const drawnLabels: { x: number; y: number; text: string }[] = [];
-        const labelOnce = (text: string, x: number, y: number, color = '#fff') => {
-            for (const d of drawnLabels) {
-                if (d.text === text && Math.abs(d.x - x) < 110 && Math.abs(d.y - y) < 26) return;
-            }
-            drawnLabels.push({ x, y, text });
-            this.drawLabel(ctx, text, x, y, color);
-        };
 
-        // 1) NPC sightings (faded), under everything — now with the creature's icon
-        //    (or person glyph for humanoids), falling back to a dot.
-        if (this.showNpcSightings) {
-            const sightings = this.buildNpcSightings(this.currentFloor, (defId) => defId);
-            for (const s of sightings) {
-                if (q && !s.n.toLowerCase().includes(q)) continue;
-                const defId = s.i; // We mapped iconIdxOf to just return defId
-                const icon = this.getNpcIcon(defId);                 // also queues the render
-                const modelless = !icon && this.isModelless('npc', defId);
-                const useIcon = icon && z >= 2.5;                    // dots when zoomed far (perf)
-                const sz = Math.max(11, Math.min(z * 1.6, 24));
-                ctx.fillStyle = 'rgba(255,90,90,0.28)';
-                const sx = (s.x - srcLeft) * z, sy = (s.z - srcTop) * z;
-                if (!inView(sx, sy)) continue;
-                if (useIcon) this.drawIcon(ctx, icon!, sx, sy, sz, 0.5);
-                else { ctx.beginPath(); ctx.arc(sx, sy, Math.max(2, baseR * 0.5), 0, Math.PI * 2); ctx.fill(); }
-            }
-        }
 
-        // 2) Objects — grouped per tile so stacked objects don't fight: one marker per
-        //    tile at its exact coordinate, with a count badge when several share it.
-        const tileGroups = new Map<string, MapObject[]>();
-        const allObjects = [...this.objectStore.values(), ...this.liveEphemeral];
-        for (const o of allObjects) {
-            if (o.floor !== undefined && o.floor !== this.currentFloor) continue;
-            if (!this.nameEnabled(o.category, o.name)) continue;
-            if (q && !(o.name.toLowerCase().includes(q) || o.category.toLowerCase().includes(q))) continue;
-            const tk = `${o.x},${o.z},${o.floor}`;
-            let arr = tileGroups.get(tk);
-            if (!arr) { arr = []; tileGroups.set(tk, arr); }
-            arr.push(o);
-        }
-        for (const group of tileGroups.values()) {
-            // Render/queue every member's icon (keeps the cache complete) and pick a
-            // representative — prefer one whose icon is already rendered.
-            let rep = group[0];
-            for (const g of group) { if (this.getObjectIcon(g)) rep = g; }
-            const o = rep;
-            const sx = (o.x - srcLeft) * z, sy = (o.z - srcTop) * z;
-            if (!inView(sx, sy)) continue;
 
-            // ONLY the object's own model icon on the map — never a borrowed category
-            // icon. While it's still rendering (or its mesh hasn't loaded near yet) show a
-            // neutral placeholder dot. (The borrowed category icon churning between scenery
-            // models was the bed↔bush flashing.)
-            const icon = this.getObjectIcon(o);
-            let hitR = baseR;
-            if (icon) {
-                const s = Math.max(24, Math.min(z * 3.0, 50));
-                this.drawIcon(ctx, icon, sx, sy, s, o.depleted ? 0.45 : 1);
-                hitR = s / 2;
-            } else {
-                // Own icon not ready (or no model): a stable category-coloured shape — never
-                // a borrowed model icon (that was the flashing).
-                this.drawShape(ctx, this.catShape(o.category), sx, sy, baseR, this.catColor(o.category), o.depleted ? 0.4 : 1);
-            }
-            if (group.length > 1) this.drawCountBadge(ctx, sx, sy, hitR, group.length);
 
-            const label = group.length > 1 ? `${this.prettify(o.name)} +${group.length - 1}` : this.prettify(o.name);
-            const sub = group.length > 1
-                ? group.map((g) => this.prettify(g.name)).join(', ').slice(0, 90) + ` • ${o.x},${o.z}`
-                : `${this.prettify(o.category)} • ${o.x},${o.z}${o.depleted ? ' • depleted' : ''}`;
-            this.hitTargets.push({ sx, sy, r: hitR, label, sub, wx: o.x, wz: o.z });
-            if (showLabels) labelOnce(label, sx, sy - hitR - 2);
-        }
 
-        // 3) Live NPCs (bright), with combat level.
-        if (this.showLiveNpcs) {
-            for (const n of this.liveNpcs) {
-                if (n.floor !== undefined && n.floor !== this.currentFloor) continue;
-                if (this.disabledNames.has(`${WorldMapPlugin.NPC_CAT}:${n.name}`) || this.disabledCats.has(WorldMapPlugin.NPC_CAT)) continue;
-                if (q && !n.name.toLowerCase().includes(q)) continue;
-                const sx = (n.x - srcLeft) * z, sy = (n.z - srcTop) * z;
-                if (!inView(sx, sy)) continue;
-                const icon = this.getNpcIcon(n.defId);
-                let hitR = baseR + 1;
-                if (icon) {
-                    const s = Math.max(16, Math.min(z * 2.1, 34));
-                    // Mobile creatures: just the model, NO ring (rings are for static nodes).
-                    this.drawIcon(ctx, icon, sx, sy, s, 1);
-                    hitR = s / 2;
-                } else {
-                    // While loading, just draw a clean dot (matches minimap style).
-                    // No messy fallback shapes that cause "wrong model" flashing!
-                    ctx.fillStyle = n.name.includes('Demon') ? '#f25' : '#0f4';
-                    ctx.beginPath();
-                    ctx.arc(sx, sy, Math.max(3, baseR * 0.8), 0, Math.PI * 2);
-                    ctx.fill();
-                }
-                this.hitTargets.push({ sx, sy, r: hitR, label: this.prettify(n.name), sub: `NPC${n.level != null ? ` • lvl ${n.level}` : ''} • ${Math.round(n.x)},${Math.round(n.z)}`, wx: n.x, wz: n.z });
-                if (showLabels) labelOnce(`${this.prettify(n.name)}${n.level != null ? ` (${n.level})` : ''}`, sx, sy - hitR - 3);
-            }
-        }
-
-        // 4) Players.
-        if (this.showPlayers) {
-            for (const p of this.players) {
-                const sx = (p.x - srcLeft) * z, sy = (p.z - srcTop) * z;
-                if (!inView(sx, sy)) continue;
-                ctx.beginPath(); ctx.arc(sx, sy, baseR * 0.8, 0, Math.PI * 2);
-                ctx.fillStyle = '#5dd5ff'; ctx.fill();
-                ctx.lineWidth = 1; ctx.strokeStyle = '#0a3a4a'; ctx.stroke();
-                if (p.name && showLabels) labelOnce(p.name, sx, sy - baseR - 2, '#bdecff');
-                this.hitTargets.push({ sx, sy, r: baseR, label: p.name || 'Player', sub: `Player • ${Math.round(p.x)},${Math.round(p.z)}`, wx: p.x, wz: p.z });
-            }
-        }
-    }
-
-    /** True if the def is loaded but has no renderable model (e.g. equipment-assembled
-     *  humanoid NPCs). Used to pick a person glyph over a "still loading" placeholder. */
-    private isModelless(kind: 'obj' | 'npc', defId: number): boolean {
-        const def = kind === 'obj'
-            ? this.gm?.objectDefsCache?.get(defId)
-            : this.gm?.entities?.npcDefsCache?.get(defId);
-        return !!def && !this.modelFileFor(kind, defId);
-    }
-
-    /** A simple person silhouette (head + shoulders) for humanoid NPCs. */
-    private drawPerson(ctx: CanvasRenderingContext2D, x: number, y: number, r: number, color: string, alpha: number) {
-        ctx.save();
-        ctx.globalAlpha = alpha;
-        ctx.fillStyle = color;
-        ctx.strokeStyle = 'rgba(0,0,0,0.7)';
-        ctx.lineWidth = 1;
-        // head
-        ctx.beginPath();
-        ctx.arc(x, y - r * 0.55, r * 0.45, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.stroke();
-        // shoulders/body
-        ctx.beginPath();
-        ctx.moveTo(x - r * 0.75, y + r);
-        ctx.quadraticCurveTo(x, y - r * 0.15, x + r * 0.75, y + r);
-        ctx.closePath();
-        ctx.fill();
-        ctx.stroke();
-        ctx.restore();
-    }
-
-    private drawShape(ctx: CanvasRenderingContext2D, shape: 'circle' | 'square' | 'diamond' | 'triangle', x: number, y: number, r: number, color: string, alpha: number) {
-        ctx.save();
-        ctx.globalAlpha = alpha;
-        ctx.fillStyle = color;
-        ctx.strokeStyle = 'rgba(0,0,0,0.7)';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        if (shape === 'circle') {
-            ctx.arc(x, y, r, 0, Math.PI * 2);
-        } else if (shape === 'square') {
-            ctx.rect(x - r, y - r, r * 2, r * 2);
-        } else if (shape === 'diamond') {
-            ctx.moveTo(x, y - r); ctx.lineTo(x + r, y); ctx.lineTo(x, y + r); ctx.lineTo(x - r, y); ctx.closePath();
-        } else {
-            ctx.moveTo(x, y - r); ctx.lineTo(x + r, y + r); ctx.lineTo(x - r, y + r); ctx.closePath();
-        }
-        ctx.fill();
-        ctx.stroke();
-        ctx.restore();
-    }
-
-    private drawLabel(ctx: CanvasRenderingContext2D, text: string, x: number, y: number, color = '#fff') {
-        ctx.save();
-        ctx.font = '11px Inter, sans-serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'bottom';
-        ctx.lineWidth = 3;
-        ctx.strokeStyle = 'rgba(0,0,0,0.85)';
-        ctx.strokeText(text, x, y);
-        ctx.fillStyle = color;
-        ctx.fillText(text, x, y);
-        ctx.restore();
-    }
-
-    private drawDestinationMarker(ctx: CanvasRenderingContext2D, x: number, y: number, animTime: number) {
-        const s = animTime;
-        const n = (Math.sin(s * 8) + 1) * 0.5;
-        const o = Math.max(0, 1 - s / 0.55);
-        ctx.save();
-        ctx.translate(x, y);
-        ctx.lineJoin = 'round';
-        if (o > 0) {
-            ctx.globalAlpha = 0.65 * o;
-            ctx.strokeStyle = '#fff0b8';
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.arc(0, 0, 7 + (1 - o) * 17, 0, Math.PI * 2);
-            ctx.stroke();
-        }
-        ctx.globalAlpha = 0.26 + n * 0.2;
-        ctx.strokeStyle = '#ffdf64';
-        ctx.lineWidth = 1.75;
-        ctx.shadowColor = 'rgba(255, 210, 80, 0.55)';
-        ctx.shadowBlur = 3 + n * 2;
-        ctx.beginPath();
-        ctx.arc(0, 0, 7.5 + n * 1.2, 0, Math.PI * 2);
-        ctx.stroke();
-        ctx.globalAlpha = 1;
-        ctx.shadowBlur = 0;
-        ctx.lineCap = 'square';
-        ctx.strokeStyle = 'rgba(0, 0, 0, 0.72)';
-        ctx.lineWidth = 3;
-        ctx.beginPath();
-        ctx.moveTo(0, -17);
-        ctx.lineTo(0, 0);
-        ctx.stroke();
-        ctx.strokeStyle = '#f7ead1';
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.moveTo(0, -17);
-        ctx.lineTo(0, 0);
-        ctx.stroke();
-        ctx.fillStyle = '#d8372b';
-        ctx.strokeStyle = '#230b07';
-        ctx.lineWidth = 1.25;
-        ctx.shadowColor = 'rgba(0, 0, 0, 0.35)';
-        ctx.shadowBlur = 2;
-        ctx.beginPath();
-        ctx.moveTo(1, -17);
-        ctx.lineTo(10, -14);
-        ctx.lineTo(1, -10);
-        ctx.closePath();
-        ctx.fill();
-        ctx.stroke();
-        ctx.restore();
-    }
-
-    private drawPlayerMarker(ctx: CanvasRenderingContext2D, x: number, y: number) {
-        ctx.beginPath();
-        ctx.arc(x, y, 5, 0, Math.PI * 2);
-        ctx.fillStyle = '#ffffff';
-        ctx.fill();
-        ctx.lineWidth = 2;
-        ctx.strokeStyle = '#000';
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.arc(x, y, 2.2, 0, Math.PI * 2);
-        ctx.fillStyle = '#2ecc71';
-        ctx.fill();
-    }
-
-    private updateTooltip() {
-        if (!this.tooltipEl) return;
-        if (!this.hoverPos) { this.tooltipEl.style.display = 'none'; return; }
-        const hit = this.pickHit(this.hoverPos.x, this.hoverPos.y);
-        if (!hit) { this.tooltipEl.style.display = 'none'; return; }
-        this.tooltipEl.style.display = 'block';
-        this.tooltipEl.style.left = `${this.hoverPos.x}px`;
-        this.tooltipEl.style.top = `${this.hoverPos.y}px`;
-        this.tooltipEl.innerHTML = `<b>${hit.label}</b><br><span style="opacity:0.75">${hit.sub}</span>`;
-    }
-
-    /** Single source of truth for follow state — keeps this.followPlayer and the header
-     *  button (text + colour) in sync. EVERYTHING that changes follow must call this
-     *  (drag, jump, floor change, recentre all used to set the flag directly and leave
-     *  the button showing the wrong state). */
-    private setFollow(on: boolean) {
-        this.followPlayer = on;
-        const b = this.followBtn;
-        if (!b) return;
-        b.innerText = on ? '◉ Follow' : '○ Follow';
-        b.style.backgroundColor = on ? '#27ae60' : '#3a3f44';
-        b.title = on ? 'Following you — click to free the camera' : 'Free camera — click to follow you';
-    }
-
-    private jumpToNearestMatch() {
-        const q = this.searchStr;
-        if (!q) return;
-        const player = this.getPlayerPos() ?? { x: this.centerX, z: this.centerZ };
-        let best: { x: number; z: number } | null = null, bestD = Infinity;
-        const consider = (x: number, z: number) => {
-            const d = (x - player.x) ** 2 + (z - player.z) ** 2;
-            if (d < bestD) { bestD = d; best = { x, z }; }
-        };
-        for (const o of this.objectStore.values()) {
-            if (this.nameEnabled(o.category, o.name) && (o.name.toLowerCase().includes(q) || o.category.toLowerCase().includes(q))) consider(o.x, o.z);
-        }
-        for (const n of this.liveNpcs) if (n.name.toLowerCase().includes(q)) consider(n.x, n.z);
-        if (this.showNpcSightings) {
-            for (const m of this.npcStore.values()) {
-                const first = m.values().next().value;
-                if (first && first.name.toLowerCase().includes(q)) for (const s of m.values()) consider(s.x, s.z);
-            }
-        }
-        if (best) {
-            this.centerX = (best as { x: number; z: number }).x;
-            this.centerZ = (best as { x: number; z: number }).z;
-            this.setFollow(false);
-            this.zoom = Math.max(this.zoom, 10);
-        }
-    }
 
     private setStatus(text: string) {
         if (this.statusEl) this.statusEl.innerText = text;
