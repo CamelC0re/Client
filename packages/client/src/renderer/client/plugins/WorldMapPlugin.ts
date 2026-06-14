@@ -1669,8 +1669,12 @@ export default class WorldMapPlugin extends Plugin {
      *  the HTML export and the detached map window. Returns null if the map isn't ready. */
     private buildMapSnapshot(): any | null {
         const cm = this.getChunkManager();
-        if (!cm) return null;
-        if (!this.rebuildWorldCanvas(cm) || !this.worldCanvas) return null;
+        if (!cm || !this.rebuildWorldCanvas(cm) || !this.worldCanvas) {
+            // Logged out / map not live — replay the last saved offline bundle (terrain +
+            // walls + objects + icons), with no live entities and Follow disabled.
+            const b = this.loadOfflineBundle();
+            return b ? { ...b, p: null, npc: [], pl: [], dest: null, online: false } : null;
+        }
         const W = this.worldW, H = this.worldH;
 
         // Terrain as a 1px/tile PNG — the viewer scales it the same way the live map does.
@@ -1734,11 +1738,27 @@ export default class WorldMapPlugin extends Plugin {
         for (let z2 = 0; z2 < H; z2++) { const row = z2 * W; for (let x2 = 0; x2 < W; x2++) { const wf = ww[row + x2]; if (wf) wl.push(x2, z2, wf); } }
 
         const player = this.getPlayerPos();
-        return {
+        const data = {
             id: this.mapId || 'world', W, H, t: terrain, ic: icons, ob: objects, ct: cats, pi: pois, mm: mmIcons,
             floor: this.currentFloor, p: player ? { x: player.x, z: player.z } : null,
             npc, pl, wl, online: !!player, dest: this.getMoveDest(),
         };
+        this.saveOfflineBundle(data); // so the map still works after logout
+        return data;
+    }
+
+    /** Cache the static map (terrain + walls + objects + icons) so the map window still
+     *  works when logged out. Uses localStorage (evilquest.net origin, survives logout and
+     *  cold launch) — plugin.data is per-user and PluginAssetCache is read-only in shipped
+     *  builds, so neither is usable offline. Stripped of live entities; ~0.5-1MB for one map. */
+    private saveOfflineBundle(data: any): void {
+        try {
+            const b = { id: data.id, W: data.W, H: data.H, t: data.t, ic: data.ic, ob: data.ob, ct: data.ct, pi: data.pi, mm: data.mm, wl: data.wl, floor: data.floor };
+            localStorage.setItem('eq_wm_offline', JSON.stringify(b));
+        } catch { /* quota exceeded — offline map just won't have the latest */ }
+    }
+    private loadOfflineBundle(): any | null {
+        try { const s = localStorage.getItem('eq_wm_offline'); return s ? JSON.parse(s) : null; } catch { return null; }
     }
 
     /** The live click-to-move destination (the vanilla minimap flag target), or null. */
