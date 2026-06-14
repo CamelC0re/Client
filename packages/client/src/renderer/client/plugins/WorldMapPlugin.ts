@@ -1986,6 +1986,9 @@ html,body{margin:0;height:100%;background:#101012;color:#e8e8e8;font:13px/1.4 In
 #view.drag{cursor:grabbing}#c{position:absolute;inset:0}
 #tip{position:absolute;background:#000d;border:1px solid #444;border-radius:4px;padding:4px 7px;font-size:12px;pointer-events:none;display:none;max-width:240px}
 #hint{position:absolute;right:8px;bottom:8px;background:#000a;padding:4px 8px;border-radius:4px;font-size:11px;pointer-events:none;color:#bbb}
+#loading{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:#101012;color:#cbd2d8;font:13px Inter,system-ui,sans-serif;z-index:6}
+.lspin{width:34px;height:34px;border:3px solid #2a3038;border-top-color:#19b9ff;border-radius:50%;animation:lspin .8s linear infinite}
+@keyframes lspin{to{transform:rotate(360deg)}}
 </style></head><body><div id="app">
 <div id="hdr"><h1>World Map</h1><input id="q" placeholder="Search objects & NPCs…">
 <div class="fl"><button id="fdown" title="Floor down">▾</button><span id="fl">Floor 0</span><button id="fup" title="Floor up">▴</button></div>
@@ -1996,12 +1999,12 @@ html,body{margin:0;height:100%;background:#101012;color:#e8e8e8;font:13px/1.4 In
 <label><input type="checkbox" id="L_npc" checked> Live NPCs</label>
 <label><input type="checkbox" id="L_pl" checked> Players</label>
 <label><input type="checkbox" id="L_lab"> Labels</label></div><div id="cats"></div></div>
-<div id="view"><canvas id="c"></canvas><div id="tip"></div><div id="hint">drag to pan · scroll to zoom · click to walk</div></div></div></div>
+<div id="view"><canvas id="c"></canvas><div id="tip"></div><div id="hint">drag to pan · scroll to zoom · click to walk</div><div id="loading"><div class="lspin"></div><div>Loading map…</div></div></div></div></div>
 <script>(function(){var D=${json};
 var IPC=(window.electron&&window.electron.ipcRenderer)?window.electron.ipcRenderer:null;
 var view=document.getElementById("view"),cv=document.getElementById("c"),ctx=cv.getContext("2d"),tip=document.getElementById("tip"),q=document.getElementById("q");
 var terrain,ICONS,MM,ICONS_S;
-function loadImgs(){terrain=new Image();terrain.src=D.t;ICONS=(D.ic||[]).map(function(s){var i=new Image();i.src=s;return i;});ICONS_S=new Array(ICONS.length);MM=(D.mm||[]).map(function(s){var i=new Image();i.src=s;return i;});}
+function loadImgs(){terrain=new Image();terrain.onload=function(){var l=document.getElementById("loading");if(l)l.style.display="none";baseSig="";requestRender();};terrain.src=D.t;ICONS=(D.ic||[]).map(function(s){var i=new Image();i.src=s;return i;});ICONS_S=new Array(ICONS.length);MM=(D.mm||[]).map(function(s){var i=new Image();i.src=s;return i;});}
 loadImgs();
 /* Bake each icon's drop-shadow once into an offscreen canvas; per-icon shadowBlur in the
    draw loop is the single most expensive op, so we drop it and draw the pre-shadowed icon. */
