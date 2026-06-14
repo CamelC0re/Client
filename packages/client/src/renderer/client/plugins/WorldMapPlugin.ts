@@ -166,6 +166,15 @@ export default class WorldMapPlugin extends Plugin {
     // regenerate every persisted icon. Old-version keys are purged on load.
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────────
+    /** The core only runs init()/start() once logged in, but registerPlugin constructs the
+     *  instance at page load. We register the sidebar icon + M-key handler here (construction)
+     *  so the map is reachable when logged OUT too — it opens the persisted offline bundle.
+     *  The live data collection / overlay still starts on login via start(). */
+    constructor() {
+        super();
+        try { this.installKeyHandler(); this.registerSidebarIcon(); } catch { /* managers not ready — start() retries */ }
+    }
+
     init() {
         this.info('World Map Plugin initializing.');
         this.settings.enable.value = true;
@@ -1141,7 +1150,10 @@ export default class WorldMapPlugin extends Plugin {
         return row;
     }
 
+    private keyHandlerInstalled = false;
     private installKeyHandler() {
+        if (this.keyHandlerInstalled) return; // idempotent — registered at construction + start
+        this.keyHandlerInstalled = true;
         window.addEventListener('keydown', (e) => {
             const t = e.target as HTMLElement | null;
             if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
