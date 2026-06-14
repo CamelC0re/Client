@@ -94,43 +94,45 @@ app.on("ready", async () => {
         // ── 1. Serve EvilLite's own renderer files ─────────────────────────
         // In dev mode: proxy to Vite dev server for TypeScript transforms + HMR
         // In production: serve from the built renderer output on disk
+        // Dev is detected by ELECTRON_RENDERER_URL (set ONLY by `electron-vite dev`). It is
+        // NOT set in `electron-vite preview` or packaged builds — both of which run the built
+        // renderer from disk. Using app.isPackaged here was the bug: preview is unpackaged but
+        // has no Vite dev server, so it proxied to a dead localhost:5173 (ERR_CONNECTION_REFUSED).
+        const devRendererUrl = process.env['ELECTRON_RENDERER_URL'];
         if (url.hostname === 'evilquest.net' && url.pathname.startsWith('/__evillite__/')) {
             const filePart = url.pathname.replace('/__evillite__/', '');
-            if (!app.isPackaged) {
-                // Dev mode: proxy to Vite
-                const viteUrl = `http://localhost:5173/${filePart}${url.search}`;
+            if (devRendererUrl) {
+                // Dev: proxy to Vite (TypeScript transforms + HMR)
                 try {
-                    return await net.fetch(viteUrl, { bypassCustomProtocolHandlers: true } as any);
+                    return await net.fetch(`${devRendererUrl}/${filePart}${url.search}`, { bypassCustomProtocolHandlers: true } as any);
                 } catch (err) {
                     console.error('[Protocol] Vite proxy failed for', filePart, err);
                     return new Response('Vite proxy failed', { status: 502 });
                 }
-            } else {
-                // Production: serve from disk
-                const localPath = path.join(__dirname, '../renderer', filePart);
-                try {
-                    const content = fs.readFileSync(localPath);
-                    return new Response(content, {
-                        headers: { 'Content-Type': localMimeType(localPath), 'Access-Control-Allow-Origin': '*' }
-                    });
-                } catch {
-                    return new Response('EvilLite asset not found: ' + filePart, { status: 404 });
-                }
+            }
+            // Built (preview or packaged): serve from the renderer output on disk.
+            const localPath = path.join(__dirname, '../renderer', filePart);
+            try {
+                const content = fs.readFileSync(localPath);
+                return new Response(content, {
+                    headers: { 'Content-Type': localMimeType(localPath), 'Access-Control-Allow-Origin': '*' }
+                });
+            } catch {
+                return new Response('EvilLite asset not found: ' + filePart, { status: 404 });
             }
         }
 
-        // Proxy Vite dev server internal paths (HMR, node_modules, source files)
-        if (!app.isPackaged && url.hostname === 'evilquest.net' &&
-            (url.pathname.startsWith('/@') || 
+        // Proxy Vite dev server internal paths (HMR, node_modules, source files) — dev only.
+        if (devRendererUrl && url.hostname === 'evilquest.net' &&
+            (url.pathname.startsWith('/@') ||
              url.pathname.startsWith('/node_modules/') ||
              url.pathname.startsWith('/client/') ||
              url.pathname.startsWith('/console/') ||
              url.pathname.startsWith('/settings/') ||
              url.pathname.startsWith('/updater/') ||
              url.pathname.startsWith('/icons/'))) {
-            const viteUrl = `http://localhost:5173${url.pathname}${url.search}`;
             try {
-                return await net.fetch(viteUrl, { bypassCustomProtocolHandlers: true } as any);
+                return await net.fetch(`${devRendererUrl}${url.pathname}${url.search}`, { bypassCustomProtocolHandlers: true } as any);
             } catch {
                 return new Response('Vite proxy failed', { status: 502 });
             }
