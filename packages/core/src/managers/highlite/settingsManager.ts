@@ -55,6 +55,18 @@ export class SettingsManager {
         document.highlite.managers.SettingsManager = this;
     }
 
+    private settingsIconReady = false;
+    /** Register the Settings sidebar icon (and its empty content panel) at page load, so it
+     *  shows on the main menu / logged out and is ordered before plugin icons. The settings
+     *  content is still built in createMenu() on login. Idempotent. */
+    ensureSettingsIcon() {
+        if (this.settingsIconReady) return;
+        this.panelManager = this.panelManager ?? document.highlite.managers.PanelManager;
+        if (!this.panelManager) return;
+        this.panelContainer = this.panelManager.requestMenuItem('🛠️', 'Settings')[1] as HTMLDivElement;
+        this.settingsIconReady = true;
+    }
+
     async init() {
         this.database = document.highlite.managers.DatabaseManager.database;
         this.pluginList = document.highlite.managers.PluginManager.plugins;
@@ -214,10 +226,8 @@ export class SettingsManager {
     }
 
     private createMenu() {
-        this.panelContainer = this.panelManager.requestMenuItem(
-            '🛠️',
-            'Settings'
-        )[1] as HTMLDivElement;
+        this.ensureSettingsIcon();
+        if (!this.panelContainer) return;
         this.panelContainer.style.display = 'flex';
         this.panelContainer.style.width = '100%';
         this.panelContainer.style.background = 'var(--theme-background)';
