@@ -1826,6 +1826,7 @@ export default class WorldMapPlugin extends Plugin {
 + '<script>(function(){var D=' + json + ';'
 + 'var view=document.getElementById("view"),cv=document.getElementById("c"),ctx=cv.getContext("2d"),tip=document.getElementById("tip"),q=document.getElementById("q");'
 + 'var terrain=new Image();terrain.src=D.t;var ICONS=D.ic.map(function(s){var i=new Image();i.src=s;return i;});var MM=D.mm.map(function(s){var i=new Image();i.src=s;return i;});'
++ 'var ICONS_S=new Array(ICONS.length);function shadowed(idx){if(ICONS_S[idx])return ICONS_S[idx];var im=ICONS[idx];if(!im||!im.complete||!im.naturalWidth)return null;var pad=4;var c=document.createElement("canvas");c.width=im.naturalWidth+pad*2;c.height=im.naturalHeight+pad*2;var x=c.getContext("2d");x.shadowColor="rgba(0,0,0,.55)";x.shadowBlur=2;x.drawImage(im,pad,pad);ICONS_S[idx]=c;return c;}'
 + 'var TAX={},nameOn={};D.ob.forEach(function(o){if(!TAX[o.c])TAX[o.c]={};TAX[o.c][o.n]=(TAX[o.c][o.n]||0)+o.k;});Object.keys(TAX).forEach(function(c){Object.keys(TAX[c]).forEach(function(n){nameOn[c+"|"+n]=true;});});var showIcons=true,showPoi=true,showLab=false;'
 + 'var cx=D.W/2,cz=D.H/2,Z=4,W=0,Hh=0,hits=[];'
 + 'function resize(){var r=view.getBoundingClientRect();W=cv.width=Math.floor(r.width);Hh=cv.height=Math.floor(r.height);render();}'
@@ -1834,7 +1835,7 @@ export default class WorldMapPlugin extends Plugin {
 + 'var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);'
 + 'if(terrain.complete&&terrain.naturalWidth){ctx.imageSmoothingEnabled=true;ctx.save();ctx.translate(-sl*Z,-st*Z);ctx.scale(Z,Z);ctx.drawImage(terrain,0,0);ctx.restore();}'
 + 'if(showIcons){for(var j=0;j<D.ob.length;j++){var o=D.ob[j];if(nameOn[o.c+"|"+o.n]===false)continue;var sx=(o.x+0.5-sl)*Z,sy=(o.z+0.5-st)*Z;if(sx<-30||sx>W+30||sy<-30||sy>Hh+30)continue;'
-+ 'var hr;if(o.i>=0&&ICONS[o.i].complete&&ICONS[o.i].naturalWidth){var sz=clamp(Z*3,24,50);ctx.save();ctx.globalAlpha=o.d?0.45:1;ctx.shadowColor="rgba(0,0,0,.55)";ctx.shadowBlur=2;ctx.drawImage(ICONS[o.i],sx-sz/2,sy-sz/2,sz,sz);ctx.restore();hr=sz/2;}'
++ 'var hr;var sc=o.i>=0?shadowed(o.i):null;if(sc){var iim=ICONS[o.i];var sz=clamp(Z*3,24,50);var k=sz/iim.naturalWidth,dw=sc.width*k,dh=sc.height*k;ctx.globalAlpha=o.d?0.45:1;ctx.drawImage(sc,sx-dw/2,sy-dh/2,dw,dh);ctx.globalAlpha=1;hr=sz/2;}'
 + 'else{var col=(D.ct.filter(function(c){return c.n==o.c;})[0]||{c:"#ffd24a"}).c;var br=clamp(Z*0.55,3,9);ctx.fillStyle=col;ctx.globalAlpha=o.d?0.4:1;ctx.beginPath();ctx.arc(sx,sy,br,0,6.28);ctx.fill();ctx.globalAlpha=1;hr=br;}'
 + 'if(o.k>1){ctx.fillStyle="#c0392b";ctx.beginPath();ctx.arc(sx+hr*0.8,sy-hr*0.8,6,0,6.28);ctx.fill();ctx.fillStyle="#fff";ctx.font="9px sans-serif";ctx.textAlign="center";ctx.textBaseline="middle";ctx.fillText(o.k>9?"9+":""+o.k,sx+hr*0.8,sy-hr*0.8);}'
 + 'hits.push({sx:sx,sy:sy,r:hr,n:o.n+(o.k>1?" +"+(o.k-1):""),s:o.c+" - "+o.x+","+o.z});'
@@ -1927,19 +1928,25 @@ html,body{margin:0;height:100%;background:#101012;color:#e8e8e8;font:13px/1.4 In
 <script>(function(){var D=${json};
 var IPC=(window.electron&&window.electron.ipcRenderer)?window.electron.ipcRenderer:null;
 var view=document.getElementById("view"),cv=document.getElementById("c"),ctx=cv.getContext("2d"),tip=document.getElementById("tip"),q=document.getElementById("q");
-var terrain,ICONS,MM;
-function loadImgs(){terrain=new Image();terrain.src=D.t;ICONS=(D.ic||[]).map(function(s){var i=new Image();i.src=s;return i;});MM=(D.mm||[]).map(function(s){var i=new Image();i.src=s;return i;});}
+var terrain,ICONS,MM,ICONS_S;
+function loadImgs(){terrain=new Image();terrain.src=D.t;ICONS=(D.ic||[]).map(function(s){var i=new Image();i.src=s;return i;});ICONS_S=new Array(ICONS.length);MM=(D.mm||[]).map(function(s){var i=new Image();i.src=s;return i;});}
 loadImgs();
+/* Bake each icon's drop-shadow once into an offscreen canvas; per-icon shadowBlur in the
+   draw loop is the single most expensive op, so we drop it and draw the pre-shadowed icon. */
+function shadowed(idx){if(ICONS_S[idx])return ICONS_S[idx];var im=ICONS[idx];if(!im||!im.complete||!im.naturalWidth)return null;var pad=4;var c=document.createElement("canvas");c.width=im.naturalWidth+pad*2;c.height=im.naturalHeight+pad*2;var x=c.getContext("2d");x.shadowColor="rgba(0,0,0,.55)";x.shadowBlur=2;x.drawImage(im,pad,pad);ICONS_S[idx]=c;return c;}
 var nameOn={};function taxState(){(D.ob||[]).forEach(function(o){if(nameOn[o.c+"|"+o.n]===undefined)nameOn[o.c+"|"+o.n]=true;});}taxState();
 var showIcons=true,showPoi=true,showLab=false,showNpc=true,showPl=true,follow=true;
 var cx=D.W/2,cz=D.H/2,Z=4,W=0,Hh=0,hits=[];
 function clamp(v,a,b){return Math.max(a,Math.min(v,b));}
+/* Render-on-demand: coalesce every change into a single rAF render instead of redrawing
+   on a timer. Callers use requestRender(); render() does the actual draw. */
+var _raf=null;function requestRender(){if(_raf)return;_raf=requestAnimationFrame(function(){_raf=null;render();});}
 function resize(){var r=view.getBoundingClientRect();W=cv.width=Math.floor(r.width);Hh=cv.height=Math.floor(r.height);render();}
 function render(){if(!W)return;hits=[];ctx.clearRect(0,0,W,Hh);
 var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);
 if(terrain.complete&&terrain.naturalWidth){ctx.imageSmoothingEnabled=true;ctx.save();ctx.translate(-sl*Z,-st*Z);ctx.scale(Z,Z);ctx.drawImage(terrain,0,0);ctx.restore();}
 if(showIcons){for(var j=0;j<D.ob.length;j++){var o=D.ob[j];if(nameOn[o.c+"|"+o.n]===false)continue;var sx=(o.x+0.5-sl)*Z,sy=(o.z+0.5-st)*Z;if(sx<-30||sx>W+30||sy<-30||sy>Hh+30)continue;
-var hr;if(o.i>=0&&ICONS[o.i].complete&&ICONS[o.i].naturalWidth){var sz=clamp(Z*3,24,50);ctx.save();ctx.globalAlpha=o.d?0.45:1;ctx.shadowColor="rgba(0,0,0,.55)";ctx.shadowBlur=2;ctx.drawImage(ICONS[o.i],sx-sz/2,sy-sz/2,sz,sz);ctx.restore();hr=sz/2;}
+var hr;var sc=o.i>=0?shadowed(o.i):null;if(sc){var im=ICONS[o.i];var sz=clamp(Z*3,24,50);var k=sz/im.naturalWidth,dw=sc.width*k,dh=sc.height*k;ctx.globalAlpha=o.d?0.45:1;ctx.drawImage(sc,sx-dw/2,sy-dh/2,dw,dh);ctx.globalAlpha=1;hr=sz/2;}
 else{var col=(D.ct.filter(function(c){return c.n==o.c;})[0]||{c:"#ffd24a"}).c;var br=clamp(Z*0.55,3,9);ctx.fillStyle=col;ctx.globalAlpha=o.d?0.4:1;ctx.beginPath();ctx.arc(sx,sy,br,0,6.28);ctx.fill();ctx.globalAlpha=1;hr=br;}
 if(o.k>1){ctx.fillStyle="#c0392b";ctx.beginPath();ctx.arc(sx+hr*0.8,sy-hr*0.8,6,0,6.28);ctx.fill();ctx.fillStyle="#fff";ctx.font="9px sans-serif";ctx.textAlign="center";ctx.textBaseline="middle";ctx.fillText(o.k>9?"9+":""+o.k,sx+hr*0.8,sy-hr*0.8);}
 hits.push({sx:sx,sy:sy,r:hr,n:o.n+(o.k>1?" +"+(o.k-1):""),s:o.c+" - "+o.x+","+o.z});
@@ -1958,14 +1965,15 @@ t.globalAlpha=.26+n*.2;t.strokeStyle="#ffdf64";t.lineWidth=1.75;t.shadowColor="r
 t.strokeStyle="rgba(0,0,0,0.72)";t.lineWidth=3;t.beginPath();t.moveTo(0,-17);t.lineTo(0,0);t.stroke();
 t.strokeStyle="#f7ead1";t.lineWidth=1.5;t.beginPath();t.moveTo(0,-17);t.lineTo(0,0);t.stroke();
 t.fillStyle="#d8372b";t.strokeStyle="#230b07";t.lineWidth=1.25;t.shadowColor="rgba(0,0,0,0.35)";t.shadowBlur=2;t.beginPath();t.moveTo(1,-17);t.lineTo(10,-14);t.lineTo(1,-10);t.closePath();t.fill();t.stroke();t.restore();}
-function destAnim(){if(D.dest){render();destRAF=requestAnimationFrame(destAnim);}else destRAF=null;}
+/* Pulse the destination flag at ~22fps (coalesced) instead of a full 60fps re-render. */
+function destAnim(){if(D.dest){requestRender();destRAF=setTimeout(destAnim,45);}else destRAF=null;}
 function ensureDestAnim(){if(D.dest&&!destRAF){destT0=performance.now();destAnim();}}
 function fit(){var pad=10;Z=clamp(Math.min(W/(D.W+pad),Hh/(D.H+pad)),0.3,48);cx=D.W/2;cz=D.H/2;render();}
 function goTo(x,z){Z=Math.max(Z,12);cx=x+0.5;cz=z+0.5;render();}
 var dragging=false,pressed=false,sx0=0,sy0=0,lx0=0,ly0=0,moved=false,DRAG_THRESH=10;
 view.addEventListener("mousedown",function(e){pressed=true;dragging=false;moved=false;sx0=lx0=e.clientX;sy0=ly0=e.clientY;});
 window.addEventListener("mouseup",function(){pressed=false;dragging=false;view.classList.remove("drag");});
-view.addEventListener("mousemove",function(e){if(pressed){if(!dragging&&Math.abs(e.clientX-sx0)+Math.abs(e.clientY-sy0)>DRAG_THRESH){dragging=true;moved=true;setFollow(false);view.classList.add("drag");}if(dragging){cx-=(e.clientX-lx0)/Z;cz-=(e.clientY-ly0)/Z;lx0=e.clientX;ly0=e.clientY;render();tip.style.display="none";}return;}
+view.addEventListener("mousemove",function(e){if(pressed){if(!dragging&&Math.abs(e.clientX-sx0)+Math.abs(e.clientY-sy0)>DRAG_THRESH){dragging=true;moved=true;setFollow(false);view.classList.add("drag");}if(dragging){cx-=(e.clientX-lx0)/Z;cz-=(e.clientY-ly0)/Z;lx0=e.clientX;ly0=e.clientY;requestRender();tip.style.display="none";}return;}
 var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top,best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}
 if(best){tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+10)+"px";tip.innerHTML="<b>"+best.n+"</b><br>"+best.s;}else tip.style.display="none";});
 view.addEventListener("click",function(e){if(moved)return;var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
@@ -2003,9 +2011,9 @@ if(IPC&&IPC.on){IPC.on("map-window:update",function(e,u){if(!u)return;
 if(u.full){var nd=u.full;D=nd;loadImgs();taxState();buildCats();setLabel();}
 if(u.p!==undefined)D.p=u.p;if(u.npc!==undefined)D.npc=u.npc;if(u.pl!==undefined)D.pl=u.pl;if(u.online!==undefined)D.online=u.online;
 if(u.dest!==undefined){var had=!!D.dest;D.dest=u.dest;if(D.dest&&!had)destT0=performance.now();}
-setFollow(follow);if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;}ensureDestAnim();render();});}
+setFollow(follow);if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;}ensureDestAnim();requestRender();});}
 buildCats();setLabel();setFollow(true);ensureDestAnim();
-window.addEventListener("resize",resize);var ld=0;[terrain].concat(ICONS,MM).forEach(function(im){im.addEventListener("load",function(){if(++ld%30==0)render();});});setTimeout(render,300);setTimeout(render,1200);
+window.addEventListener("resize",resize);[terrain].concat(ICONS,MM).forEach(function(im){im.addEventListener("load",requestRender);});setTimeout(render,300);setTimeout(render,1200);
 resize();fit();})();</script></body></html>`;
     }
 
