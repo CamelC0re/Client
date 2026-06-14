@@ -199,6 +199,9 @@ export default class WorldMapPlugin extends Plugin {
         // state but leaves the detached OS window open (it lives in the main process). Re-attach
         // to it so it un-freezes on its own instead of needing a close+reopen.
         try { void this.reattachMapWindow(); } catch { /* best effort */ }
+        // Preload the shipped terrain prebake so the offline map has terrain/walls even with
+        // no saved bundle (fresh install) or a blank one (force-logout corruption).
+        try { void this.loadShippedBundles(); } catch { /* best effort */ }
     }
 
     init() {
@@ -669,8 +672,10 @@ export default class WorldMapPlugin extends Plugin {
                 this.sessionNpcs.set(id, { id, defId, name, x, z, floor, level, seen: Date.now() });
             }
 
-            // Accumulate sighting (rounded to a tile).
-            const rx = Math.round(x), rz = Math.round(z);
+            // Accumulate sighting, snapped to the tile CENTRE (x.5) so stored markers line up
+            // with the terrain the same way objects (already tile-centred coords) and live NPCs
+            // do — the renderer maps a world coord G straight to (G - srcLeft)*z with no +0.5.
+            const rx = Math.floor(x) + 0.5, rz = Math.floor(z) + 0.5;
             let perDef = this.npcStore.get(defId);
             if (!perDef) { perDef = new Map(); this.npcStore.set(defId, perDef); }
             const skey = `${rx},${rz}`;
@@ -799,30 +804,46 @@ export default class WorldMapPlugin extends Plugin {
         if (!this.data.filters || typeof this.data.filters !== 'object') this.data.filters = {};
     }
 
+    /** Merge ObjRecord[] into objectStore (union by tile+def key — never removes). */
+    private mergeObjRecords(arr: any[]) {
+        for (const o of (arr ?? [])) {
+            if (!o) continue;
+            const key = `${o.x},${o.z},${o.floor},${o.defId}`;
+            if (!this.objectStore.has(key)) {
+                this.objectStore.set(key, { defId: o.defId, category: o.category, name: o.name, x: o.x, z: o.z, floor: o.floor, depleted: false, assetId: o.assetId ?? '' });
+            }
+        }
+    }
+    /** Merge persisted NPC records ({defId:{name,pts}}) into npcStore (union of sighting tiles). */
+    private mergeNpcRecords(npc: Record<string, { name: string; pts: number[][] }>) {
+        for (const defIdStr of Object.keys(npc ?? {})) {
+            const defId = Number(defIdStr);
+            const entry = npc[defIdStr];
+            let m = this.npcStore.get(defId);
+            if (!m) { m = new Map<string, NpcSighting>(); this.npcStore.set(defId, m); }
+            for (const p of (entry.pts ?? [])) {
+                const [x, z, level, floor, seen] = p; // [x,z,level,floor?,seen?]
+                const k = `${x},${z}`;
+                if (!m.has(k)) m.set(k, { defId, name: entry.name, x, z, level: level < 0 ? undefined : level, floor: floor ?? undefined, seen: seen || 0 });
+            }
+            if (!this.npcNameDef.has(entry.name)) this.npcNameDef.set(entry.name, defId);
+        }
+    }
+
     private loadStores() {
         try {
             this.ensureDataShape();
             this.migrateLegacyLocalStorage();
+            // Primary: the core's per-user reactive store (IndexedDB). Then UNION in the
+            // synchronous localStorage backup — IndexedDB writes are debounced, so an abrupt
+            // reload (the AFK kick) can lose the latest; the localStorage backup survives it,
+            // so whichever is richer wins and the live store isn't reset to a tiny patch.
             const mapData = this.data.maps[this.mapId];
-            if (!mapData) return;
-            const arr = (mapData.obj ?? []) as any[];
-            for (const o of arr) {
-                const key = `${o.x},${o.z},${o.floor},${o.defId}`;
-                this.objectStore.set(key, { defId: o.defId, category: o.category, name: o.name, x: o.x, z: o.z, floor: o.floor, depleted: false, assetId: o.assetId ?? '' });
-            }
-            const npc = (mapData.npc ?? {}) as Record<string, { name: string; pts: number[][] }>;
-            for (const defIdStr of Object.keys(npc)) {
-                const defId = Number(defIdStr);
-                const entry = npc[defIdStr];
-                const m = new Map<string, NpcSighting>();
-                for (const p of entry.pts) {
-                    // [x, z, level, floor?, seen?] — floor/seen added later; old saves omit them.
-                    const [x, z, level, floor, seen] = p;
-                    m.set(`${x},${z}`, { defId, name: entry.name, x, z, level: level < 0 ? undefined : level, floor: floor ?? undefined, seen: seen || 0 });
-                }
-                this.npcStore.set(defId, m);
-                if (!this.npcNameDef.has(entry.name)) this.npcNameDef.set(entry.name, defId);
-            }
+            if (mapData) { this.mergeObjRecords(mapData.obj as any[]); this.mergeNpcRecords(mapData.npc as any); }
+            try {
+                const raw = localStorage.getItem(`eq_wm_store:${this.mapId}`);
+                if (raw) { const bk = JSON.parse(raw); this.mergeObjRecords(bk.obj); this.mergeNpcRecords(bk.npc); }
+            } catch { /* no/invalid backup */ }
         } catch (e: any) {
             this.warn('loadStores failed: ' + (e?.message || e));
         }
@@ -844,6 +865,10 @@ export default class WorldMapPlugin extends Plugin {
             }
             // Single assignment per map -> one reactive write (debounced by core).
             this.data.maps[this.mapId] = { obj: objArr, npc: npcObj };
+            // Synchronous durable backup: the core's IndexedDB write is debounced and can be
+            // lost if the renderer reloads (AFK kick) before it flushes. localStorage writes
+            // immediately, so loadStores can union it back in and the explored store survives.
+            try { localStorage.setItem(`eq_wm_store:${this.mapId}`, JSON.stringify({ obj: objArr, npc: npcObj })); } catch { /* quota */ }
         } catch (e: any) {
             this.warn('persistStores failed: ' + (e?.message || e));
         }
@@ -1982,9 +2007,10 @@ export default class WorldMapPlugin extends Plugin {
     private buildMapSnapshot(): any | null {
         const cm = this.getChunkManager();
         if (!cm || !this.rebuildWorldCanvas(cm) || !this.worldCanvas) {
-            // Logged out / map not live — replay the last saved offline bundle (terrain +
-            // walls + objects + icons), with no live entities and Follow disabled.
-            const b = this.loadOfflineBundle();
+            // Logged out / map not live — replay the best offline bundle (the user's saved
+            // exploration, with terrain/walls backfilled from the shipped prebake if the saved
+            // one is missing/blank), with no live entities and Follow disabled.
+            const b = this.bestOfflineBundle();
             return b ? { ...b, p: null, npc: [], pl: [], dest: null, online: false } : null;
         }
         const W = this.worldW, H = this.worldH;
@@ -2070,14 +2096,15 @@ export default class WorldMapPlugin extends Plugin {
     private saveOfflineBundle(data: any): void {
         try {
             const b = { id: data.id, W: data.W, H: data.H, t: data.t, ic: data.ic, ob: data.ob, ct: data.ct, pi: data.pi, mm: data.mm, wl: data.wl, ns: data.ns, floor: data.floor };
-            // Don't let a degraded snapshot clobber a richer saved map. When the 5-min AFK
-            // kick (or any lost connection) tears the world down, a full-snapshot timer can
-            // fire mid-teardown and build a blank/partial terrain; without this guard it
-            // would overwrite the good offline bundle, so the logged-out map goes blank and
-            // a reopen is needed to recover. Keep the better terrain for this map+floor.
+            // Don't let a degraded snapshot clobber a richer saved map — in terrain OR object
+            // count. The 5-min AFK kick tears the world down (blank terrain) and a reload can
+            // start with a near-empty objectStore before the persisted data reloads; without
+            // this guard a full-snapshot timer would overwrite the good bundle, blanking the
+            // logged-out map / dropping its objects. Keep the better one for this map+floor.
             const prev = this.loadOfflineBundle();
+            const obc = (x: any) => Array.isArray(x?.ob) ? x.ob.length : 0;
             if (prev && prev.id === b.id && prev.floor === b.floor &&
-                this.terrainScore(b) < this.terrainScore(prev) * 0.85) {
+                (this.terrainScore(b) < this.terrainScore(prev) * 0.85 || obc(b) < obc(prev) * 0.85)) {
                 return; // saved bundle is meaningfully richer — keep it
             }
             const json = JSON.stringify(b);
@@ -2100,6 +2127,37 @@ export default class WorldMapPlugin extends Plugin {
     private terrainScore(b: any): number {
         if (!b) return 0;
         return (typeof b.t === 'string' ? b.t.length : 0) + (Array.isArray(b.wl) ? b.wl.length * 8 : 0);
+    }
+
+    /** Pull the shipped terrain prebake (build-committed full map) into memory once, so the
+     *  offline snapshot can use it synchronously as a fallback. Safe to call repeatedly. */
+    private async loadShippedBundles(): Promise<void> {
+        if (this.shippedBundles) return;
+        try { this.shippedBundles = (await this.terrainCacheStore.load()) || {}; } catch { this.shippedBundles = {}; }
+    }
+    /** A shipped prebake bundle (parsed) for a map+floor, or any one if no exact match. */
+    private shippedBundleFor(id: string, floor: number): any | null {
+        const m = this.shippedBundles; if (!m) return null;
+        let raw = m[`${id}:${floor}`] ?? m[`${id || 'kcmap'}:0`];
+        if (!raw) { const k = Object.keys(m)[0]; if (k) raw = m[k]; }
+        if (!raw) return null;
+        try { return JSON.parse(raw); } catch { return null; }
+    }
+    /** Best available offline bundle: the user's saved exploration, but with terrain/walls
+     *  backfilled from the shipped prebake when the saved one is missing or blank/weak. This
+     *  is what stops the "objects but no terrain/walls" offline view (corrupted bundle or a
+     *  fresh install that never logged in). */
+    private bestOfflineBundle(): any | null {
+        const ls = this.loadOfflineBundle();
+        const pre = this.shippedBundleFor(ls?.id || this.mapId || 'kcmap', ls?.floor ?? this.currentFloor ?? 0);
+        if (!ls) return pre;          // no saved bundle → ship the prebake (fresh install)
+        if (!pre) return ls;          // no prebake → whatever we saved
+        // Saved bundle is poorer than the prebake — in terrain OR object count → use the whole
+        // self-consistent prebake. Grafting just terrain would leave the POIs/icons that also
+        // went missing, and mixing icon indices across bundles is unsafe (ob→ic, pi→mm refs).
+        const obc = (x: any) => Array.isArray(x?.ob) ? x.ob.length : 0;
+        if (this.terrainScore(ls) < this.terrainScore(pre) * 0.85 || obc(ls) < obc(pre) * 0.85) return pre;
+        return ls;
     }
 
     /** The live click-to-move destination (the vanilla minimap flag target), or null. */
@@ -2266,16 +2324,16 @@ export default class WorldMapPlugin extends Plugin {
 + 'var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);'
 + 'if(terrain.complete&&terrain.naturalWidth){ctx.imageSmoothingEnabled=true;ctx.save();ctx.translate(-sl*Z,-st*Z);ctx.scale(Z,Z);ctx.drawImage(terrain,0,0);ctx.restore();}'
 + 'if(D.wl&&D.wl.length){ctx.fillStyle="rgb(220,216,200)";var wt=Math.max(1.5,Z*0.15);for(var wi=0;wi<D.wl.length;wi+=3){var wx=D.wl[wi],wz=D.wl[wi+1],wf=D.wl[wi+2];var wsx=(wx-sl)*Z,wsy=(wz-st)*Z;if(wsx<-Z||wsx>W+Z||wsy<-Z||wsy>Hh+Z)continue;if(wf&1)ctx.fillRect(wsx,wsy,Z,wt);if(wf&4)ctx.fillRect(wsx,wsy+Z-wt,Z,wt);if(wf&8)ctx.fillRect(wsx,wsy,wt,Z);if(wf&2)ctx.fillRect(wsx+Z-wt,wsy,wt,Z);}}'
-+ 'if(showIcons){for(var j=0;j<D.ob.length;j++){var o=D.ob[j];if(nameOn[o.c+"|"+o.n]===false)continue;var sx=(o.x+0.5-sl)*Z,sy=(o.z+0.5-st)*Z;if(sx<-30||sx>W+30||sy<-30||sy>Hh+30)continue;'
++ 'if(showIcons){for(var j=0;j<D.ob.length;j++){var o=D.ob[j];if(nameOn[o.c+"|"+o.n]===false)continue;var sx=(o.x-sl)*Z,sy=(o.z-st)*Z;if(sx<-30||sx>W+30||sy<-30||sy>Hh+30)continue;'
 + 'var hr;var sc=o.i>=0?shadowed(o.i):null;if(sc){var iim=ICONS[o.i];var sz=clamp(Z*3,24,50);var k=sz/iim.naturalWidth,dw=sc.width*k,dh=sc.height*k;ctx.globalAlpha=o.d?0.45:1;ctx.drawImage(sc,sx-dw/2,sy-dh/2,dw,dh);ctx.globalAlpha=1;hr=sz/2;}'
 + 'else{var col=(D.ct.filter(function(c){return c.n==o.c;})[0]||{c:"#ffd24a"}).c;var br=clamp(Z*0.55,3,9);ctx.fillStyle=col;ctx.globalAlpha=o.d?0.4:1;ctx.beginPath();ctx.arc(sx,sy,br,0,6.28);ctx.fill();ctx.globalAlpha=1;hr=br;}'
 + 'if(o.k>1){ctx.fillStyle="#c0392b";ctx.beginPath();ctx.arc(sx+hr*0.8,sy-hr*0.8,6,0,6.28);ctx.fill();ctx.fillStyle="#fff";ctx.font="9px sans-serif";ctx.textAlign="center";ctx.textBaseline="middle";ctx.fillText(o.k>9?"9+":""+o.k,sx+hr*0.8,sy-hr*0.8);}'
 + 'hits.push({sx:sx,sy:sy,r:hr,n:o.n+(o.k>1?" +"+(o.k-1):""),s:o.c+" - "+o.x+","+o.z});'
 + 'if(showLab){ctx.fillStyle="#fff";ctx.font="11px sans-serif";ctx.textAlign="center";ctx.textBaseline="bottom";ctx.shadowColor="#000";ctx.shadowBlur=3;ctx.fillText(o.n,sx,sy-hr-2);ctx.shadowBlur=0;}}}'
-+ 'if(showPoi){for(var p=0;p<D.pi.length;p++){var P=D.pi[p];var px=(P.x+0.5-sl)*Z,py=(P.z+0.5-st)*Z;if(px<-30||px>W+30||py<-30||py>Hh+30)continue;var u=P.s;'
++ 'if(showPoi){for(var p=0;p<D.pi.length;p++){var P=D.pi[p];var px=(P.x-sl)*Z,py=(P.z-st)*Z;if(px<-30||px>W+30||py<-30||py>Hh+30)continue;var u=P.s;'
 + 'ctx.save();ctx.globalAlpha=0.7;ctx.fillStyle="rgba(0,0,0,.68)";ctx.beginPath();ctx.arc(px,py,u*0.55,0,6.28);ctx.fill();ctx.restore();'
 + 'if(P.m>=0&&MM[P.m].complete&&MM[P.m].naturalWidth)ctx.drawImage(MM[P.m],px-u/2,py-u/2,u,u);hits.push({sx:px,sy:py,r:u/2,n:P.n,s:P.x+","+P.z});}}'
-+ 'if(D.p){var ppx=(D.p.x+0.5-sl)*Z,ppy=(D.p.z+0.5-st)*Z;ctx.save();ctx.fillStyle="#19b9ff";ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.beginPath();ctx.arc(ppx,ppy,6,0,6.28);ctx.fill();ctx.stroke();ctx.restore();}'
++ 'if(D.p){var ppx=(D.p.x-sl)*Z,ppy=(D.p.z-st)*Z;ctx.save();ctx.fillStyle="#19b9ff";ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.beginPath();ctx.arc(ppx,ppy,6,0,6.28);ctx.fill();ctx.stroke();ctx.restore();}'
 + '}'
 + 'function fit(){var pad=10;Z=clamp(Math.min(W/(D.W+pad),Hh/(D.H+pad)),0.3,48);cx=D.W/2;cz=D.H/2;render();}'
 + 'var dragging=false,lx=0,ly=0,moved=false;'
@@ -2393,13 +2451,13 @@ function buildBase(){base.width=W;base.height=Hh;bctx.clearRect(0,0,W,Hh);baseHi
 var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);
 if(terrain.complete&&terrain.naturalWidth){bctx.imageSmoothingEnabled=true;bctx.save();bctx.translate(-sl*Z,-st*Z);bctx.scale(Z,Z);bctx.drawImage(terrain,0,0);bctx.restore();}
 if(D.wl&&D.wl.length){bctx.fillStyle="rgb(220,216,200)";var wt=Math.max(1.5,Z*0.15);for(var wi=0;wi<D.wl.length;wi+=3){var wx=D.wl[wi],wz=D.wl[wi+1],wf=D.wl[wi+2];var wsx=(wx-sl)*Z,wsy=(wz-st)*Z;if(wsx<-Z||wsx>W+Z||wsy<-Z||wsy>Hh+Z)continue;if(wf&1)bctx.fillRect(wsx,wsy,Z,wt);if(wf&4)bctx.fillRect(wsx,wsy+Z-wt,Z,wt);if(wf&8)bctx.fillRect(wsx,wsy,wt,Z);if(wf&2)bctx.fillRect(wsx+Z-wt,wsy,wt,Z);}}
-if(showIcons){for(var j=0;j<D.ob.length;j++){var o=D.ob[j];if(nameOn[o.c+"|"+o.n]===false)continue;var sx=(o.x+0.5-sl)*Z,sy=(o.z+0.5-st)*Z;if(sx<-30||sx>W+30||sy<-30||sy>Hh+30)continue;
+if(showIcons){for(var j=0;j<D.ob.length;j++){var o=D.ob[j];if(nameOn[o.c+"|"+o.n]===false)continue;var sx=(o.x-sl)*Z,sy=(o.z-st)*Z;if(sx<-30||sx>W+30||sy<-30||sy>Hh+30)continue;
 var hr;var sc=o.i>=0?shadowed(o.i):null;if(sc){var im=ICONS[o.i];var sz=clamp(Z*3,24,50);var k=sz/im.naturalWidth,dw=sc.width*k,dh=sc.height*k;bctx.globalAlpha=o.d?0.45:1;bctx.drawImage(sc,sx-dw/2,sy-dh/2,dw,dh);bctx.globalAlpha=1;hr=sz/2;}
 else{var col=(D.ct.filter(function(c){return c.n==o.c;})[0]||{c:"#ffd24a"}).c;var br=clamp(Z*0.55,3,9);bctx.fillStyle=col;bctx.globalAlpha=o.d?0.4:1;bctx.beginPath();bctx.arc(sx,sy,br,0,6.28);bctx.fill();bctx.globalAlpha=1;hr=br;}
 if(o.k>1){bctx.fillStyle="#c0392b";bctx.beginPath();bctx.arc(sx+hr*0.8,sy-hr*0.8,6,0,6.28);bctx.fill();bctx.fillStyle="#fff";bctx.font="9px sans-serif";bctx.textAlign="center";bctx.textBaseline="middle";bctx.fillText(o.k>9?"9+":""+o.k,sx+hr*0.8,sy-hr*0.8);}
 baseHits.push({sx:sx,sy:sy,r:hr,n:o.n+(o.k>1?" +"+(o.k-1):""),s:o.c+" - "+o.x+","+o.z});
 if(showLab){bctx.fillStyle="#fff";bctx.font="11px sans-serif";bctx.textAlign="center";bctx.textBaseline="bottom";bctx.shadowColor="#000";bctx.shadowBlur=3;bctx.fillText(o.n,sx,sy-hr-2);bctx.shadowBlur=0;}}}
-if(showPoi){for(var p=0;p<D.pi.length;p++){var P=D.pi[p];var px=(P.x+0.5-sl)*Z,py=(P.z+0.5-st)*Z;if(px<-30||px>W+30||py<-30||py>Hh+30)continue;var u=P.s;
+if(showPoi){for(var p=0;p<D.pi.length;p++){var P=D.pi[p];var px=(P.x-sl)*Z,py=(P.z-st)*Z;if(px<-30||px>W+30||py<-30||py>Hh+30)continue;var u=P.s;
 bctx.save();bctx.globalAlpha=0.7;bctx.fillStyle="rgba(0,0,0,.68)";bctx.beginPath();bctx.arc(px,py,u*0.55,0,6.28);bctx.fill();bctx.restore();
 if(P.m>=0&&MM[P.m].complete&&MM[P.m].naturalWidth)bctx.drawImage(MM[P.m],px-u/2,py-u/2,u,u);baseHits.push({sx:px,sy:py,r:u/2,n:P.n,s:P.x+","+P.z});}}}
 function render(){if(!W)return;
@@ -2407,7 +2465,7 @@ var sig=[cx,cz,Z,W,Hh,showIcons,showPoi,showLab,nameVer,dataVer].join(",");
 if(sig!==baseSig){buildBase();baseSig=sig;}
 ctx.clearRect(0,0,W,Hh);ctx.drawImage(base,0,0);hits=baseHits.slice();
 var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);
-function drawNpc(N,alpha,tag){var nx=(N.x+0.5-sl)*Z,ny=(N.z+0.5-st)*Z;if(nx<-20||nx>W+20||ny<-20||ny>Hh+20)return;
+function drawNpc(N,alpha,tag){var nx=(N.x-sl)*Z,ny=(N.z-st)*Z;if(nx<-20||nx>W+20||ny<-20||ny>Hh+20)return;
 var nii=(N.i!==undefined&&N.i>=0)?N.i:(npcIcon[N.n]!==undefined?npcIcon[N.n]:-1);var nsc=nii>=0?shadowed(nii):null;var nhr;ctx.globalAlpha=alpha;
 if(nsc){var nim=ICONS[nii];var nsz=clamp(Z*2.6,20,44);var nk=nsz/nim.naturalWidth,ndw=nsc.width*nk,ndh=nsc.height*nk;ctx.drawImage(nsc,nx-ndw/2,ny-ndh/2,ndw,ndh);nhr=nsz/2;}
 else{ctx.fillStyle=tag==="live"?"#f1c40f":"#9aa0a6";ctx.strokeStyle="rgba(0,0,0,.6)";ctx.lineWidth=1;ctx.beginPath();ctx.arc(nx,ny,4,0,6.28);ctx.fill();ctx.stroke();nhr=5;}
@@ -2417,9 +2475,9 @@ if(npcMode===1){var SN=D.ns||[];for(var si=0;si<SN.length;si++)drawNpc(SN[si],0.
 else{var LV=D.npc||[],SN2=D.ns||[];
 for(var si2=0;si2<SN2.length;si2++){var S=SN2[si2],near=false;for(var li=0;li<LV.length;li++){var ddx=LV[li].x-S.x,ddz=LV[li].z-S.z;if(ddx*ddx+ddz*ddz<=16){near=true;break;}}if(!near)drawNpc(S,0.5,"stored");}
 for(var li2=0;li2<LV.length;li2++)drawNpc(LV[li2],1,"live");}}
-if(showPl&&D.pl){for(var pl2=0;pl2<D.pl.length;pl2++){var L=D.pl[pl2];var lx=(L.x+0.5-sl)*Z,ly=(L.z+0.5-st)*Z;if(lx<-10||lx>W+10||ly<-10||ly>Hh+10)continue;ctx.fillStyle="#2ecc71";ctx.strokeStyle="#fff";ctx.lineWidth=1;ctx.beginPath();ctx.arc(lx,ly,4,0,6.28);ctx.fill();ctx.stroke();hits.push({sx:lx,sy:ly,r:5,n:L.n,s:"Player - "+L.x+","+L.z});}}
-if(D.dest){var dsx=(D.dest.x+0.5-sl)*Z,dsy=(D.dest.z+0.5-st)*Z;drawDest(ctx,dsx,dsy);}
-if(D.p){var ppx=(D.p.x+0.5-sl)*Z,ppy=(D.p.z+0.5-st)*Z;ctx.save();ctx.fillStyle="#19b9ff";ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.beginPath();ctx.arc(ppx,ppy,6,0,6.28);ctx.fill();ctx.stroke();ctx.restore();}}
+if(showPl&&D.pl){for(var pl2=0;pl2<D.pl.length;pl2++){var L=D.pl[pl2];var lx=(L.x-sl)*Z,ly=(L.z-st)*Z;if(lx<-10||lx>W+10||ly<-10||ly>Hh+10)continue;ctx.fillStyle="#2ecc71";ctx.strokeStyle="#fff";ctx.lineWidth=1;ctx.beginPath();ctx.arc(lx,ly,4,0,6.28);ctx.fill();ctx.stroke();hits.push({sx:lx,sy:ly,r:5,n:L.n,s:"Player - "+L.x+","+L.z});}}
+if(D.dest){var dsx=(D.dest.x-sl)*Z,dsy=(D.dest.z-st)*Z;drawDest(ctx,dsx,dsy);}
+if(D.p){var ppx=(D.p.x-sl)*Z,ppy=(D.p.z-st)*Z;ctx.save();ctx.fillStyle="#19b9ff";ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.beginPath();ctx.arc(ppx,ppy,6,0,6.28);ctx.fill();ctx.stroke();ctx.restore();}}
 var destT0=0,destRAF=null;
 function drawDest(t,e,i){var s=(performance.now()-destT0)/1000,n=(Math.sin(s*8)+1)*.5,o=Math.max(0,1-s/.55);t.save();t.translate(e,i);t.lineJoin="round";
 if(o>0){t.globalAlpha=.65*o;t.strokeStyle="#fff0b8";t.lineWidth=2;t.beginPath();t.arc(0,0,7+(1-o)*17,0,Math.PI*2);t.stroke();}
@@ -2512,6 +2570,11 @@ resize();fit();})();</script></body></html>`;
      *  asset cache (data/world-map-terrain.json). Packaged users load a full map up
      *  front; in dev it re-bakes as you explore so the shipped cache can be updated. */
     private terrainCacheStore = new PluginAssetCache('world-map-terrain');
+    /** In-memory copy of the shipped terrain prebake (key `${id}:${floor}` -> bundle JSON),
+     *  loaded once so the offline snapshot can fall back to it synchronously when the user's
+     *  localStorage bundle is missing or has blank/weak terrain (e.g. a fresh install that
+     *  never logged in, or a force-logout that wiped the live terrain). */
+    private shippedBundles: Record<string, string> | null = null;
     private iconFailed = new Set<string>();
     private iconPending = new Set<string>();
     private iconQueue: { key: string; file: string }[] = [];
@@ -3162,8 +3225,8 @@ resize();fit();})();</script></body></html>`;
         const pad = 20;
         for (const m of this.minimapMarkers) {
             if ((m as any).floor !== undefined && (m as any).floor !== this.currentFloor) continue;
-            const sx = (m.x + 0.5 - srcLeft) * z;
-            const sy = (m.z + 0.5 - srcTop) * z;
+            const sx = (m.x - srcLeft) * z;
+            const sy = (m.z - srcTop) * z;
             if (sx < -pad || sx > dw + pad || sy < -pad || sy > dh + pad) continue;
 
             const u = Math.max(8, Math.min(32, m.size));
@@ -3188,7 +3251,7 @@ resize();fit();})();</script></body></html>`;
             }
 
             const hitRadius = (img && img.complete && img.naturalWidth > 0) ? u / 2 : 9;
-            this.hitTargets.push({ sx, sy, r: hitRadius, label: m.label || m.icon || 'Marker', sub: `Minimap marker • ${m.x},${m.z}`, wx: m.x + 0.5, wz: m.z + 0.5 });
+            this.hitTargets.push({ sx, sy, r: hitRadius, label: m.label || m.icon || 'Marker', sub: `Minimap marker • ${m.x},${m.z}`, wx: m.x, wz: m.z });
         }
     }
 
@@ -3271,7 +3334,7 @@ resize();fit();})();</script></body></html>`;
                 const useIcon = icon && z >= 2.5;                    // dots when zoomed far (perf)
                 const sz = Math.max(11, Math.min(z * 1.6, 24));
                 ctx.fillStyle = 'rgba(255,90,90,0.28)';
-                const sx = (s.x + 0.5 - srcLeft) * z, sy = (s.z + 0.5 - srcTop) * z;
+                const sx = (s.x - srcLeft) * z, sy = (s.z - srcTop) * z;
                 if (!inView(sx, sy)) continue;
                 if (useIcon) this.drawIcon(ctx, icon!, sx, sy, sz, 0.5);
                 else { ctx.beginPath(); ctx.arc(sx, sy, Math.max(2, baseR * 0.5), 0, Math.PI * 2); ctx.fill(); }
@@ -3297,7 +3360,7 @@ resize();fit();})();</script></body></html>`;
             let rep = group[0];
             for (const g of group) { if (this.getObjectIcon(g)) rep = g; }
             const o = rep;
-            const sx = (o.x + 0.5 - srcLeft) * z, sy = (o.z + 0.5 - srcTop) * z;
+            const sx = (o.x - srcLeft) * z, sy = (o.z - srcTop) * z;
             if (!inView(sx, sy)) continue;
 
             // ONLY the object's own model icon on the map — never a borrowed category
@@ -3321,7 +3384,7 @@ resize();fit();})();</script></body></html>`;
             const sub = group.length > 1
                 ? group.map((g) => this.prettify(g.name)).join(', ').slice(0, 90) + ` • ${o.x},${o.z}`
                 : `${this.prettify(o.category)} • ${o.x},${o.z}${o.depleted ? ' • depleted' : ''}`;
-            this.hitTargets.push({ sx, sy, r: hitR, label, sub, wx: o.x + 0.5, wz: o.z + 0.5 });
+            this.hitTargets.push({ sx, sy, r: hitR, label, sub, wx: o.x, wz: o.z });
             if (showLabels) labelOnce(label, sx, sy - hitR - 2);
         }
 
