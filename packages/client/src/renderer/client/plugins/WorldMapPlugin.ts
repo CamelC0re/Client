@@ -2432,6 +2432,10 @@ loadImgs();
    draw loop is the single most expensive op, so we drop it and draw the pre-shadowed icon. */
 function shadowed(idx){if(ICONS_S[idx])return ICONS_S[idx];var im=ICONS[idx];if(!im||!im.complete||!im.naturalWidth)return null;var pad=4;var c=document.createElement("canvas");c.width=im.naturalWidth+pad*2;c.height=im.naturalHeight+pad*2;var x=c.getContext("2d");x.shadowColor="rgba(0,0,0,.55)";x.shadowBlur=2;x.drawImage(im,pad,pad);ICONS_S[idx]=c;return c;}
 var nameOn={};function taxState(){(D.ob||[]).forEach(function(o){if(nameOn[o.c+"|"+o.n]===undefined)nameOn[o.c+"|"+o.n]=true;});}taxState();
+/* Which legend categories are expanded — persisted across rebuilds so a full-snapshot
+   refresh (every ~7s) never collapses a dropdown the user opened. lastCatSig skips the
+   rebuild entirely when the category/name set is unchanged. */
+var catOpen={},lastCatSig="";
 /* NPC name -> model-icon index, learned from full snapshots; light position-only updates
    reuse it so NPCs keep their 3D model icon between full snapshots. */
 var npcIcon={};function buildNpcIcon(){(D.npc||[]).forEach(function(N){if(N.i!==undefined&&N.i>=0)npcIcon[N.n]=N.i;});}buildNpcIcon();
@@ -2477,7 +2481,7 @@ for(var si2=0;si2<SN2.length;si2++){var S=SN2[si2],near=false;for(var li=0;li<LV
 for(var li2=0;li2<LV.length;li2++)drawNpc(LV[li2],1,"live");}}
 if(showPl&&D.pl){for(var pl2=0;pl2<D.pl.length;pl2++){var L=D.pl[pl2];var lx=(L.x-sl)*Z,ly=(L.z-st)*Z;if(lx<-10||lx>W+10||ly<-10||ly>Hh+10)continue;ctx.fillStyle="#2ecc71";ctx.strokeStyle="#fff";ctx.lineWidth=1;ctx.beginPath();ctx.arc(lx,ly,4,0,6.28);ctx.fill();ctx.stroke();hits.push({sx:lx,sy:ly,r:5,n:L.n,s:"Player - "+L.x+","+L.z});}}
 if(D.dest){var dsx=(D.dest.x-sl)*Z,dsy=(D.dest.z-st)*Z;drawDest(ctx,dsx,dsy);}
-if(D.p){var ppx=(D.p.x-sl)*Z,ppy=(D.p.z-st)*Z;ctx.save();ctx.fillStyle="#19b9ff";ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.beginPath();ctx.arc(ppx,ppy,6,0,6.28);ctx.fill();ctx.stroke();ctx.restore();}}
+if(D.p){var ppx=(D.p.x-sl)*Z,ppy=(D.p.z-st)*Z;ctx.save();ctx.fillStyle="#19b9ff";ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.beginPath();ctx.arc(ppx,ppy,6,0,6.28);ctx.fill();ctx.stroke();ctx.restore();}drawPings();}
 var destT0=0,destRAF=null;
 function drawDest(t,e,i){var s=(performance.now()-destT0)/1000,n=(Math.sin(s*8)+1)*.5,o=Math.max(0,1-s/.55);t.save();t.translate(e,i);t.lineJoin="round";
 if(o>0){t.globalAlpha=.65*o;t.strokeStyle="#fff0b8";t.lineWidth=2;t.beginPath();t.arc(0,0,7+(1-o)*17,0,Math.PI*2);t.stroke();}
@@ -2488,6 +2492,17 @@ t.fillStyle="#d8372b";t.strokeStyle="#230b07";t.lineWidth=1.25;t.shadowColor="rg
 /* Pulse the destination flag at ~22fps (coalesced) instead of a full 60fps re-render. */
 function destAnim(){if(D.dest){requestRender();destRAF=setTimeout(destAnim,45);}else destRAF=null;}
 function ensureDestAnim(){if(D.dest&&!destRAF){destT0=performance.now();destAnim();}}
+/* Legend ping: clicking a legend icon pulses a yellow glow ring around every matching
+   object so you can spot them. 3 pulses (~650ms each) then it stops. */
+var pingPts=null,pingT0=0,pingRAF=null,PING_PULSES=3,PING_DUR=650;
+function pingObjects(pts){if(!pts||!pts.length)return;pingPts=pts;pingT0=performance.now();if(!pingRAF)pingAnim();}
+function pingAnim(){if(pingPts&&(performance.now()-pingT0)<PING_PULSES*PING_DUR){requestRender();pingRAF=setTimeout(pingAnim,33);}else{pingPts=null;pingRAF=null;requestRender();}}
+function drawPings(){if(!pingPts)return;var el=performance.now()-pingT0;if(el>=PING_PULSES*PING_DUR){pingPts=null;return;}
+var ph=(el%PING_DUR)/PING_DUR,a=1-ph,sl=cx-W/(2*Z),st=cz-Hh/(2*Z);
+var r0=Math.max(9,Z*1.5),rad=r0+ph*Math.max(13,Z*1.5);
+ctx.save();ctx.lineWidth=Math.max(2,Z*0.16);ctx.strokeStyle="rgba(255,226,72,"+(0.95*a)+")";ctx.shadowColor="rgba(255,216,60,0.95)";ctx.shadowBlur=10*a+5;
+for(var i=0;i<pingPts.length;i++){var px=(pingPts[i][0]-sl)*Z,py=(pingPts[i][1]-st)*Z;if(px<-40||px>W+40||py<-40||py>Hh+40)continue;ctx.beginPath();ctx.arc(px,py,rad,0,6.28);ctx.stroke();}
+ctx.restore();}
 function fit(){var pad=10;Z=clamp(Math.min(W/(D.W+pad),Hh/(D.H+pad)),0.3,48);cx=D.W/2;cz=D.H/2;render();}
 function goTo(x,z){Z=Math.max(Z,12);cx=x+0.5;cz=z+0.5;render();}
 /* Drag-vs-click (option C): panning only engages on a deliberate drag — moved past a
@@ -2520,17 +2535,23 @@ document.getElementById("L_pl").onchange=function(e){showPl=e.target.checked;ren
 document.getElementById("L_lab").onchange=function(e){showLab=e.target.checked;render();};
 q.oninput=function(){var s=q.value.trim().toLowerCase();if(!s)return;var best=null,bd=1e9;function consider(x,z,n){if(n.toLowerCase().indexOf(s)<0)return;var d=(x-cx)*(x-cx)+(z-cz)*(z-cz);if(d<bd){bd=d;best=[x,z];}}D.ob.forEach(function(o){consider(o.x,o.z,o.n+" "+o.c);});(D.npc||[]).forEach(function(N){consider(N.x,N.z,N.n);});D.pi.forEach(function(P){consider(P.x,P.z,P.n);});if(best)goTo(best[0],best[1]);};
 function esc(t){var d=document.createElement("span");d.textContent=t;return d.innerHTML;}
-function buildCats(){var box=document.getElementById("cats");box.innerHTML="";var TAX={};D.ob.forEach(function(o){if(!TAX[o.c])TAX[o.c]={};TAX[o.c][o.n]=(TAX[o.c][o.n]||0)+o.k;});
+function buildCats(){var box=document.getElementById("cats");var TAX={};D.ob.forEach(function(o){if(!TAX[o.c])TAX[o.c]={};TAX[o.c][o.n]=(TAX[o.c][o.n]||0)+o.k;});
+var sig=Object.keys(TAX).sort().map(function(c){return c+":"+Object.keys(TAX[c]).sort().join(",");}).join("|");
+if(sig===lastCatSig)return; /* unchanged → keep current DOM (expand + scroll state) */
+lastCatSig=sig;box.innerHTML="";
 var catIcon={},nameIcon={};D.ob.forEach(function(o){if(o.i>=0){if(catIcon[o.c]===undefined)catIcon[o.c]=o.i;if(nameIcon[o.c+"|"+o.n]===undefined)nameIcon[o.c+"|"+o.n]=o.i;}});
 var swatch=function(i,col){return i!==undefined?"<img class=ci src=\\""+D.ic[i]+"\\">":"<span class=sw style=background:"+col+"></span>";};
 Object.keys(TAX).sort().forEach(function(c){var col=(D.ct.filter(function(x){return x.n==c;})[0]||{c:"#ffd24a"}).c;var names=Object.keys(TAX[c]).sort();var tot=0;names.forEach(function(n){tot+=TAX[c][n];});
 var g=document.createElement("div");g.className="cat";var head=document.createElement("div");head.className="chead";
-head.innerHTML="<input type=checkbox class=cc checked>"+swatch(catIcon[c],col)+"<span class=cn>"+esc(c)+" ("+tot+")</span><span class=exp>▸</span>";
-var subs=document.createElement("div");subs.className="subs";subs.style.display="none";
+head.innerHTML="<input type=checkbox class=cc checked>"+swatch(catIcon[c],col)+"<span class=cn>"+esc(c)+" ("+tot+")</span><span class=exp>"+(catOpen[c]?"▾":"▸")+"</span>";
+var subs=document.createElement("div");subs.className="subs";subs.style.display=catOpen[c]?"block":"none";
 names.forEach(function(n){var l=document.createElement("label");l.className="sub";l.innerHTML="<input type=checkbox class=nc "+(nameOn[c+"|"+n]===false?"":"checked")+">"+swatch(nameIcon[c+"|"+n],col)+esc(n)+" ("+TAX[c][n]+")";
-var nb=l.querySelector("input");nb.onchange=function(){nameOn[c+"|"+n]=nb.checked;var any=names.some(function(x){return nameOn[c+"|"+x]!==false;});head.querySelector(".cc").checked=any;nameVer++;render();};subs.appendChild(l);});
+var nb=l.querySelector("input");nb.onchange=function(){nameOn[c+"|"+n]=nb.checked;var any=names.some(function(x){return nameOn[c+"|"+x]!==false;});head.querySelector(".cc").checked=any;nameVer++;render();};
+var nsw=l.querySelector(".ci,.sw");if(nsw){nsw.style.cursor="pointer";nsw.title="Ping on map";nsw.onclick=function(ev){ev.stopPropagation();ev.preventDefault();if(!nb.checked){nb.checked=true;nameOn[c+"|"+n]=true;head.querySelector(".cc").checked=true;nameVer++;}var pts=[];D.ob.forEach(function(o){if(o.c===c&&o.n===n)pts.push([o.x,o.z]);});pingObjects(pts);render();};}
+subs.appendChild(l);});
 var cc=head.querySelector(".cc");cc.onchange=function(){var on=cc.checked;names.forEach(function(n){nameOn[c+"|"+n]=on;});subs.querySelectorAll(".nc").forEach(function(x){x.checked=on;});nameVer++;render();};
-head.querySelector(".exp").onclick=function(){var open=subs.style.display==="none";subs.style.display=open?"block":"none";this.textContent=open?"▾":"▸";};
+var chSw=head.querySelector(".ci,.sw");if(chSw){chSw.style.cursor="pointer";chSw.title="Ping on map";chSw.onclick=function(ev){ev.stopPropagation();ev.preventDefault();if(!cc.checked){cc.checked=true;names.forEach(function(n){nameOn[c+"|"+n]=true;});subs.querySelectorAll(".nc").forEach(function(x){x.checked=true;});nameVer++;}var pts=[];D.ob.forEach(function(o){if(o.c===c&&nameOn[c+"|"+o.n]!==false)pts.push([o.x,o.z]);});pingObjects(pts);render();};}
+head.querySelector(".exp").onclick=function(){var open=subs.style.display==="none";subs.style.display=open?"block":"none";this.textContent=open?"▾":"▸";catOpen[c]=open;};
 g.appendChild(head);g.appendChild(subs);box.appendChild(g);});}
 function setLabel(){document.getElementById("fl").innerText="Floor "+(D.floor||0);}
 if(IPC&&IPC.on){IPC.on("map-window:update",function(e,u){if(!u)return;
