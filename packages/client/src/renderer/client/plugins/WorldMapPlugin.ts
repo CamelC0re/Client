@@ -2028,17 +2028,21 @@ function destAnim(){if(D.dest){requestRender();destRAF=setTimeout(destAnim,45);}
 function ensureDestAnim(){if(D.dest&&!destRAF){destT0=performance.now();destAnim();}}
 function fit(){var pad=10;Z=clamp(Math.min(W/(D.W+pad),Hh/(D.H+pad)),0.3,48);cx=D.W/2;cz=D.H/2;render();}
 function goTo(x,z){Z=Math.max(Z,12);cx=x+0.5;cz=z+0.5;render();}
-var dragging=false,pressed=false,sx0=0,sy0=0,lx0=0,ly0=0,moved=false,DRAG_THRESH=10;
-view.addEventListener("mousedown",function(e){pressed=true;dragging=false;moved=false;sx0=lx0=e.clientX;sy0=ly0=e.clientY;});
-window.addEventListener("mouseup",function(){pressed=false;dragging=false;view.classList.remove("drag");});
-view.addEventListener("mousemove",function(e){if(pressed){if(!dragging&&Math.abs(e.clientX-sx0)+Math.abs(e.clientY-sy0)>DRAG_THRESH){dragging=true;moved=true;setFollow(false);view.classList.add("drag");}if(dragging){cx-=(e.clientX-lx0)/Z;cz-=(e.clientY-ly0)/Z;lx0=e.clientX;ly0=e.clientY;requestRender();tip.style.display="none";}return;}
-var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top,best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}
-if(best){tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+10)+"px";tip.innerHTML="<b>"+best.n+"</b><br>"+best.s;}else tip.style.display="none";});
-view.addEventListener("click",function(e){if(moved)return;var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
+/* Drag-vs-click (option C): panning only engages on a deliberate drag — moved past a
+   generous threshold AND held a moment (or a big fast sweep). A quick tap, even with a few
+   px of drift, stays a click → walk there. Click-to-move is handled on mouseup, not the
+   browser 'click' event, so drift never eats the click. */
+var dragging=false,pressed=false,sx0=0,sy0=0,lx0=0,ly0=0,pressT=0,DRAG_THRESH=18,HOLD_MS=150;
+function clickAt(e){var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
 var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}
 var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);var wx=sl+mx/Z,wz=st+my/Z;
 if(best){var m=best.s.match(/(-?\\d+),(-?\\d+)/);if(m){goTo(parseInt(m[1]),parseInt(m[2]));}}
-else if(D.online&&IPC){IPC.send("map-window:input",{t:"move",x:Math.round(wx),z:Math.round(wz)});}});
+else if(D.online&&IPC){IPC.send("map-window:input",{t:"move",x:Math.round(wx),z:Math.round(wz)});}}
+view.addEventListener("mousedown",function(e){pressed=true;dragging=false;sx0=lx0=e.clientX;sy0=ly0=e.clientY;pressT=Date.now();});
+window.addEventListener("mouseup",function(e){if(pressed&&!dragging&&e.target&&(view===e.target||view.contains(e.target)))clickAt(e);pressed=false;dragging=false;view.classList.remove("drag");});
+view.addEventListener("mousemove",function(e){if(pressed){if(!dragging){var dist=Math.abs(e.clientX-sx0)+Math.abs(e.clientY-sy0);if((dist>DRAG_THRESH&&(Date.now()-pressT)>HOLD_MS)||dist>DRAG_THRESH*3){dragging=true;setFollow(false);view.classList.add("drag");}}if(dragging){cx-=(e.clientX-lx0)/Z;cz-=(e.clientY-ly0)/Z;lx0=e.clientX;ly0=e.clientY;requestRender();tip.style.display="none";}return;}
+var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top,best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}
+if(best){tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+10)+"px";tip.innerHTML="<b>"+best.n+"</b><br>"+best.s;}else tip.style.display="none";});
 view.addEventListener("wheel",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var f=e.deltaY<0?1.15:1/1.15;Z=clamp(Z*f,0.3,48);cx=wx+W/(2*Z)-mx/Z;cz=wz+Hh/(2*Z)-my/Z;render();},{passive:false});
 function setFollow(on){follow=on&&!!D.online;var b=document.getElementById("follow");b.className="btn"+(D.online?"":" dis")+(follow?"":" off");b.innerText=(follow?"◉":"○")+" Follow";if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;render();}}
 document.getElementById("follow").onclick=function(){if(!D.online)return;setFollow(!follow);};
