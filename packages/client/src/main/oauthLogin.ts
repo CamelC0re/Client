@@ -254,6 +254,12 @@ type LoginResult = { ok: boolean; token?: string; username?: string; clientId?: 
 /** The access token obtained this app session, cached so the renderer's per-load
  *  auto-login call doesn't trigger a fresh network refresh (which rotates the token). */
 let sessionAccess: { token: string; username: string } | null = null;
+// Epoch ms when the current access token / session cookie expires. The EvilQuest session
+// token is only good for a couple hours; without a proactive refresh, auth-gated assets
+// (item icons under /items/3d, model GLBs) start 401-ing mid-session. Default to 1h if the
+// server doesn't send expires_in.
+let accessExpiresAt = 0;
+let refreshing: Promise<LoginResult> | null = null;
 
 function persist(tok: TokenResult): void {
     const s = readStore();
@@ -261,6 +267,7 @@ function persist(tok: TokenResult): void {
     s.last_active = Date.now(); // a successful login/refresh counts as activity
     writeStore(s);
     sessionAccess = { token: tok.access_token, username: tok.username || '' };
+    accessExpiresAt = Date.now() + (tok.expires_in && tok.expires_in > 0 ? tok.expires_in * 1000 : 60 * 60 * 1000);
 }
 
 /** Clear the persisted + in-memory session so the silent auto-login won't immediately
@@ -271,6 +278,7 @@ export function clearOAuthSession(): void {
     const rt = readStore().refresh_token;
     clearRefresh();        // sync: auto-login finds no refresh token after this
     sessionAccess = null;  // sync: drop the in-session cached access token
+    accessExpiresAt = 0;
     if (rt) {
         net.fetch(REVOKE, {
             method: 'POST',
@@ -330,6 +338,42 @@ export function registerOAuthLogin(): void {
     ipcMain.handle('oauth:logout', async (): Promise<LoginResult> => {
         clearOAuthSession();
         return { ok: true };
+    });
+
+    // Proactive token refresh: the renderer calls this periodically while logged in. When the
+    // access token / session cookie is near expiry we refresh it (refresh_token grant), which
+    // also re-sets the eq_ws_session cookie that auth-gates assets — preventing the multi-hour
+    // session 401s (item icons, model GLBs failing to load). Returns the new token so the
+    // renderer can update localStorage.evilquest_token. Coalesced so concurrent calls share one
+    // network refresh; rotates the refresh token like the silent auto-login.
+    ipcMain.handle('oauth:ensure-fresh', async (): Promise<LoginResult & { refreshed?: boolean }> => {
+        if (!sessionAccess) return { ok: false, reason: 'no-session' };
+        const SKEW_MS = 5 * 60 * 1000; // refresh 5 min before expiry
+        if (Date.now() < accessExpiresAt - SKEW_MS) return { ok: true, refreshed: false };
+        const store = readStore();
+        if (!store.refresh_token) return { ok: false, reason: 'no-refresh-token' };
+        if (!refreshing) {
+            refreshing = (async (): Promise<LoginResult> => {
+                try {
+                    const tok = await tokenRequest({
+                        grant_type: 'refresh_token',
+                        client_id: clientId(),
+                        refresh_token: store.refresh_token!,
+                        device_id: store.device_id!,
+                    });
+                    persist(tok);
+                    console.log('[OAuth] proactive token refresh ok — session extended');
+                    return { ok: true, token: tok.access_token, username: tok.username || '', clientId: clientId() };
+                } catch (e) {
+                    console.warn('[OAuth] proactive token refresh failed', e);
+                    return { ok: false, reason: 'refresh-failed: ' + String(e) };
+                } finally {
+                    refreshing = null;
+                }
+            })();
+        }
+        const r = await refreshing;
+        return { ...r, refreshed: r.ok };
     });
 
     // The renderer pings this while the user is logged in + in-world, keeping last_active

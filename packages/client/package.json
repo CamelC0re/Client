@@ -1,7 +1,7 @@
 {
   "name": "@evillite/client",
   "productName": "EvilLite",
-  "version": "0.2.0-beta.14",
+  "version": "0.2.0-beta.15",
   "description": "A RuneLite-esque Client for the game EvilQuest",
   "homepage": "https://github.com/RyeL1te/Core#readme",
   "engines": {

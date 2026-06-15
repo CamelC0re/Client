@@ -154,9 +154,21 @@ try {
 // silently re-login (matching EvilQuest's AFK window); once these pings stop (app closed
 // or AFK-kicked), a later cold start requires a manual login — the first login of a
 // session is never silent. See oauth:heartbeat / oauth:auto-login in oauthLogin.ts.
-setInterval(() => {
+setInterval(async () => {
     const u = (document as any).highlite?.gameHooks?.GameManager?.Instance?.username ?? (window as any).gm?.username;
     if (u) { try { window.electron.ipcRenderer.send('oauth:heartbeat'); } catch { /* ignore */ } }
+    // Proactive token refresh: while we hold a session, keep the EvilQuest access token + the
+    // eq_ws_session cookie fresh so auth-gated assets (item icons, model GLBs) don't start
+    // 401-ing after a couple hours. Main no-ops until the token is near expiry.
+    try {
+        if (localStorage.getItem('evilquest_token')) {
+            const r = await window.electron.ipcRenderer.invoke('oauth:ensure-fresh');
+            if (r?.refreshed && r.token) {
+                localStorage.setItem('evilquest_token', r.token);
+                console.log('[EvilLite] OAuth token refreshed (session extended)');
+            }
+        }
+    } catch { /* ignore */ }
 }, 60 * 1000);
 
 async function obtainGameClient() {

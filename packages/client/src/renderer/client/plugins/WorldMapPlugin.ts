@@ -185,6 +185,9 @@ export default class WorldMapPlugin extends Plugin {
         // Preload the shipped terrain prebake so the offline map has terrain/walls even with
         // no saved bundle (fresh install) or a blank one (force-logout corruption).
         try { void this.loadShippedBundles(); } catch { /* best effort */ }
+        // Bake the rotated stone background now (same-origin at page load) so the map shows the
+        // correct orientation even when opened logged-out/offline — not just after warmUp().
+        try { void this.bakeStoneTexture(); } catch { /* best effort */ }
     }
 
     init() {
@@ -1990,6 +1993,10 @@ resize();fit();})();</script></body></html>`;
     private iconPending = new Set<string>();
     private iconQueue: { key: string; file: string }[] = [];
     private iconRendering = false;
+    // Back-off when model fetches start returning 401/403 (the EvilQuest session token lapsed):
+    // stop hammering the server so we don't spam failures while the token refresh kicks in.
+    private iconAuthFailStreak = 0;
+    private iconQueuePausedUntil = 0;
     /** Representative ready icon per object category / `cat name` — drives the
      *  legend "parent" icons and the fallback for childless members. */
     private catRepIcon = new Map<string, HTMLImageElement>();
@@ -2431,9 +2438,11 @@ resize();fit();})();</script></body></html>`;
 
     private async processIconQueue(): Promise<void> {
         if (this.iconRendering || !this.bjs) return;
+        if (Date.now() < this.iconQueuePausedUntil) return; // backing off after auth failures
         this.iconRendering = true;
         try {
             while (this.iconQueue.length) {
+                if (Date.now() < this.iconQueuePausedUntil) break;
                 // Trim queue if it grew too large (new objects all visible at once on first load).
                 // Drop from the tail so the nearest/most-needed items (pushed first) render first.
                 if (!this.bulkRendering && this.iconQueue.length > WorldMapPlugin.MAX_ICON_QUEUE) {
@@ -2450,11 +2459,23 @@ resize();fit();})();</script></body></html>`;
                         // Report to the generic asset cache so the dev cache accumulates
                         // this icon for the build (no-op in packaged builds).
                         this.iconCacheStore.save(key, dataUrl);
+                        this.iconAuthFailStreak = 0; // a success means auth is fine
                     } else this.iconFailed.add(key);
                 } catch (e: any) {
                     this.iconFailed.add(key);
                     this.lastIconDiag = `ERR ${key} ${file}: ${e?.message || e}`;
                     this.sendDiag(`QUEUE-ERR ${key} ${file}: ${e?.message || e} :: ${(e?.stack || '').slice(0, 300)}`);
+                    // Auth lapse (token expired) → 401/403. Back off so we stop hammering the
+                    // server with failing model fetches until the token refresh restores access.
+                    if (/\b(401|403|unauthorized|forbidden)\b/i.test(`${e?.message || e}`)) {
+                        if (++this.iconAuthFailStreak >= 4) {
+                            this.iconQueue.length = 0; this.iconPending.clear();
+                            this.iconQueuePausedUntil = Date.now() + 90 * 1000; // resume after refresh
+                            this.sendDiag('icon queue paused 90s — model fetches returning auth errors (token likely expired)');
+                            this.iconPending.delete(key);
+                            break;
+                        }
+                    } else this.iconAuthFailStreak = 0;
                 } finally {
                     this.iconPending.delete(key);
                 }
