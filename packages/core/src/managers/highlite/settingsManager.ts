@@ -22,6 +22,7 @@ import type { HighliteSchema } from '../../interfaces/highlite/database/database
 import { type Plugin } from '../../interfaces/highlite/plugin/plugin.class';
 import { PluginSettings, SettingsTypes } from '../../interfaces/highlite/plugin/pluginSettings.interface';
 import type { PanelManager } from './panelManager';
+import { resolveUsername } from '../../utilities/resolveUsername';
 
 export class SettingsManager {
     private static instance: SettingsManager;
@@ -54,13 +55,25 @@ export class SettingsManager {
         document.highlite.managers.SettingsManager = this;
     }
 
+    private settingsIconReady = false;
+    /** Register the Settings sidebar icon (and its empty content panel) at page load, so it
+     *  shows on the main menu / logged out and is ordered before plugin icons. The settings
+     *  content is still built in createMenu() on login. Idempotent. */
+    ensureSettingsIcon() {
+        if (this.settingsIconReady) return;
+        this.panelManager = this.panelManager ?? document.highlite.managers.PanelManager;
+        if (!this.panelManager) return;
+        this.panelContainer = this.panelManager.requestMenuItem('🛠️', 'Settings')[1] as HTMLDivElement;
+        this.settingsIconReady = true;
+    }
+
     async init() {
         this.database = document.highlite.managers.DatabaseManager.database;
         this.pluginList = document.highlite.managers.PluginManager.plugins;
         this.pluginList = this.pluginList.map(plugin => plugin.instance).filter((instance): instance is Plugin => instance !== undefined);
 
         this.panelManager = document.highlite.managers.PanelManager;
-        this.username = document.highlite.gameHooks.EntityManager.Instance._mainPlayer._nameLowerCase;
+        this.username = resolveUsername();
         this.createMenu();
         this.isInitialized = true;
         return Promise.resolve();
@@ -213,10 +226,8 @@ export class SettingsManager {
     }
 
     private createMenu() {
-        this.panelContainer = this.panelManager.requestMenuItem(
-            '🛠️',
-            'Settings'
-        )[1] as HTMLDivElement;
+        this.ensureSettingsIcon();
+        if (!this.panelContainer) return;
         this.panelContainer.style.display = 'flex';
         this.panelContainer.style.width = '100%';
         this.panelContainer.style.background = 'var(--theme-background)';

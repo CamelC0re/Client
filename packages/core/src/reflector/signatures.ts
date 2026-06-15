@@ -23,7 +23,14 @@ import { ClassSignature, EnumSignature } from './types';
 export const ClassSignatures: [string, ClassSignature][] = [
 
     // Define all the class signatures
-    ['EntityManager', { methods: ['CurrentOnlinePlayerCount', 'NPCs'] }],
+    // GameManager is the top-level instance (window.gm). It is NOT a game-side singleton,
+    // so its live instance is captured by the HookManager on first hooked-method call and
+    // exposed as gameHooks.GameManager.Instance (see hookManager.registerClassHook).
+    ['GameManager', { methods: ['updateMinimap', 'showPlayerChatBubble', 'worldObjectDisplayName', 'waitForCurrentLocalPlayerReady'] }],
+    // EvilQuest's entity manager (class `ue`): NPCs, remote players, ground items.
+    // Like GameManager it is not a static singleton, so the HookManager captures
+    // its live instance on first hooked-method call -> gameHooks.EntityManager.Instance.
+    ['EntityManager', { methods: ['createRemotePlayer', 'createNpc', 'findNearestNpc', 'createGroundItem'] }],
     ['GroundItemManager', { methods: ['GroundItemCount'] }],
     ['MeshManager', { methods: ['getInstanceCountForMeshByFileName'] }],
     ['WorldMapManager', { methods: ['NextWorldEntityTypeID'] }],

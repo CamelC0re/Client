@@ -19,6 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import { Plugin } from "../../interfaces/highlite/plugin/plugin.class";
 import { DatabaseManager } from "./databaseManager";
+import { resolveUsername } from "../../utilities/resolveUsername";
 import onChange from 'on-change';
 export class PluginDataManager {
     private static instance: PluginDataManager;
@@ -45,7 +46,7 @@ export class PluginDataManager {
 
     public async initialize() {
         this.databaseManager = new DatabaseManager();
-        this.username = document.highlite.gameHooks.EntityManager.Instance._mainPlayer._nameLowerCase;
+        this.username = resolveUsername();
 
         const data = await this.databaseManager.database.get('data', this.username);
         this.inMemoryCache = data || {};

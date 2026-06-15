@@ -16,13 +16,52 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>. -->
 <!doctype html>
 <html lang="en">
     <head>
+        <script>
+            // ── 1. Removed naive window.chrome spoofing (detectable by reCAPTCHA) ─────────
+
+
+
+            // ── 3. Error logging — surface game engine failures to main process ─────────
+            window.onerror = function(msg, src, line, col, err) {
+                console.error('[GameError]', msg, 'at', src + ':' + line, err?.stack || '');
+            };
+            window.addEventListener('unhandledrejection', function(e) {
+                console.error('[GameRejection]', e.reason?.message || String(e.reason), e.reason?.stack || '');
+            });
+
+            // ── 4. WebSocket URL failsafe + logging ──────────────────────────────────
+            // Patch WebSocket to: (a) upgrade ws:// to wss://, (b) log all connections.
+            try {
+                var _OrigWS = window.WebSocket;
+                function _PatchedWS(url, protocols) {
+                    if (typeof url === 'string') {
+                        var fixed = url.replace(/^ws:\/\/evilquest\.net/, 'wss://evilquest.net');
+                        if (fixed !== url) console.log('[WS-PATCH] ' + url + ' → ' + fixed);
+                        url = fixed;
+                    }
+                    console.log('[WS-CREATE] url=' + url + ' protocols=' + JSON.stringify(protocols));
+                    var ws = protocols !== undefined ? new _OrigWS(url, protocols) : new _OrigWS(url);
+                    ws.addEventListener('open', function() { console.log('[WS-OPEN] ' + url); });
+                    ws.addEventListener('close', function(e) { console.log('[WS-CLOSE] code=' + e.code + ' reason=' + e.reason + ' url=' + url); });
+                    ws.addEventListener('error', function(e) { console.log('[WS-ERROR] ' + url + ' ' + (e.message || '')); });
+                    return ws;
+                }
+                _PatchedWS.prototype = _OrigWS.prototype;
+                _PatchedWS.CONNECTING = _OrigWS.CONNECTING;
+                _PatchedWS.OPEN = _OrigWS.OPEN;
+                _PatchedWS.CLOSING = _OrigWS.CLOSING;
+                _PatchedWS.CLOSED = _OrigWS.CLOSED;
+                window.WebSocket = _PatchedWS;
+            } catch(e) {}
+        </script>
         <script type="importmap">
             {
                 "imports": {
-                    "@highlite/plugin-api": "https://cdn.jsdelivr.net/npm/@evillite/core@0.1.1/dist/index.min.js",
-                    "@highlite/core": "https://cdn.jsdelivr.net/npm/@evillite/core@0.1.1/dist/index.min.js",
-                    "@ryelite/core": "https://cdn.jsdelivr.net/npm/@evillite/core@0.1.1/dist/index.min.js",
-                    "@evillite/core": "https://cdn.jsdelivr.net/npm/@evillite/core@0.1.1/dist/index.min.js",
+                    "@highlite/plugin-api": "https://cdn.jsdelivr.net/npm/@evillite/core@0.1.2/dist/index.min.js",
+                    "@highlite/core": "https://cdn.jsdelivr.net/npm/@evillite/core@0.1.2/dist/index.min.js",
+                    "@ryelite/core": "https://cdn.jsdelivr.net/npm/@evillite/core@0.1.2/dist/index.min.js",
+                    "@evillite/core": "https://cdn.jsdelivr.net/npm/@evillite/core@0.1.2/dist/index.min.js",
+                    "@evillite/core/": "https://cdn.jsdelivr.net/npm/@evillite/core@0.1.2/",
                     "@babylonjs/": "https://cdn.jsdelivr.net/npm/@babylonjs/"
                 }
             }
@@ -49,6 +88,55 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>. -->
                 transform: scale(1.1);
                 transition: transform 0.2s ease;
             }
+
+            /* ── Window layout ──────────────────────────────────────────────────────
+               Two modes, toggled by a body class (see layout.ts), driven by the
+               "Layout Mode" setting:
+                 • Reserve Space — titlebar (top) + plugin sidebar (right) take real
+                   layout room; the game shrinks to fit between them (RuneLite-style).
+                 • Overlay — the game fills the window (clicks unaffected) and the
+                   titlebar + sidebar float on top.                                    */
+            html, body { margin: 0; height: 100%; }
+            body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+            /* #main holds the game + the plugin sidebar (highlite_bar) as a flex row. */
+            #main {
+                position: relative;
+                display: flex;
+                flex-direction: row;
+                flex: 1 1 auto;
+                min-height: 0;
+                min-width: 0;
+            }
+            #game-wrapper { flex: 1 1 auto; min-width: 0; }
+
+            .highlite_titlebar {
+                left: 0;
+                right: 0;
+                z-index: 2147483646;
+                transition: transform 0.18s ease, opacity 0.18s ease;
+            }
+            .highlite_titlebar.eq-titlebar-hidden {
+                transform: translateY(-100%);
+                opacity: 0;
+                pointer-events: none;
+            }
+
+            /* Reserve Space: titlebar sits in normal flow (reserves its height); the
+               sidebar is a flex sibling of the game (reserves its width). */
+            body.eq-layout-reserve .highlite_titlebar { position: relative; flex: 0 0 auto; }
+            body.eq-layout-reserve.eq-titlebar-autohide .highlite_titlebar { position: fixed; top: 0; }
+
+            /* Overlay: titlebar + sidebar are fixed, floating over the full-window game. */
+            body.eq-layout-overlay .highlite_titlebar { position: fixed; top: 0; }
+            body.eq-layout-overlay .highlite_bar {
+                position: fixed; right: 0; bottom: 0; top: var(--titlebar-height);
+            }
+            body.eq-layout-overlay.eq-titlebar-autohide .highlite_bar { top: 0; }
+            body.eq-layout-overlay .highlite_bar_selected_content {
+                position: fixed; right: 30px; bottom: 0; top: var(--titlebar-height);
+            }
+            body.eq-layout-overlay.eq-titlebar-autohide .highlite_bar_selected_content { top: 0; }
         </style>
     </head>
     <body>
@@ -114,7 +202,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>. -->
             <source src="/media/login_screen.webm" type="video/webm"/>
         </video>
         -->
-        <div id="game-wrapper" style="width: 100%; height: calc(100vh - var(--titlebar-height, 28px)); position: relative; overflow: hidden; transform: translate(0, 0);"></div>
+        <div id="game-wrapper" style="position: relative; overflow: hidden;"></div>
         <script type="module" src="client/client.ts"></script>
     </body>
 </html>

@@ -1,7 +1,7 @@
 {
   "name": "@evillite/client",
   "productName": "EvilLite",
-  "version": "0.2.0",
+  "version": "0.2.0-beta.15",
   "description": "A RuneLite-esque Client for the game EvilQuest",
   "homepage": "https://github.com/RyeL1te/Core#readme",
   "engines": {
@@ -18,9 +18,13 @@
   "author": "Ryelite Team",
   "main": "./out/main/index.js",
   "scripts": {
-    "dev": "electron-vite dev",
-    "start": "electron-vite preview",
-    "build": "electron-vite build",
+    "dev": "NO_SANDBOX=1 electron-vite dev",
+    "start": "npm run build && NO_SANDBOX=1 electron-vite preview",
+    "preview": "NO_SANDBOX=1 electron-vite preview",
+    "build": "electron-vite build && node scripts/copy-plugin-data.mjs",
+    "sync:plugin": "node scripts/sync-plugin.mjs",
+    "dist": "npm run sync:plugin && npm run build && electron-builder --publish never",
+    "try": "npm run sync:plugin && npm run build:unpack && node scripts/run-unpacked.mjs",
     "build:unpack": "npm run build && electron-builder --dir",
     "build:win": "npm run build && electron-builder --win",
     "build:mac": "npm run build && electron-builder --mac",
@@ -31,27 +35,36 @@
     "release": "electron-builder"
   },
   "build": {
-    "appId": "com.ryelite.desktop",
-    "copyright": "Copyright © 2025 RyeLite",
+    "appId": "net.evilquest.evillite",
+    "copyright": "Copyright © 2025 EvilLite",
     "asar": true,
     "files": [
-      "out/**/*.*"
+      "out/**/*.*",
+      "!**/node_modules/electron/**",
+      "!**/node_modules/electron-builder/**",
+      "!**/node_modules/app-builder-lib/**",
+      "!**/node_modules/electron-vite/**",
+      "!**/node_modules/@babylonjs/**",
+      "!**/node_modules/vite/**",
+      "!**/node_modules/typescript/**"
     ],
-    "productName": "RyeLite",
+    "productName": "EvilLite",
     "publish": [
       {
         "provider": "github",
-        "owner": "RyeL1te",
-        "repo": "RyeliteDesktop"
+        "owner": "Metsutan",
+        "repo": "EvilLite"
       }
     ],
     "mac": {
       "category": "public.app-category.games",
+      "icon": "static/icons/icon.icns",
       "target": [
         {
           "target": "dmg",
           "arch": [
-            "universal"
+            "x64",
+            "arm64"
           ]
         }
       ]
@@ -66,49 +79,74 @@
           ]
         }
       ],
-      "icon": "build/icon.ico"
+      "icon": "static/icons/icon.ico"
     },
     "linux": {
       "target": [
+        {
+          "target": "deb",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
         {
           "target": "AppImage",
           "arch": [
             "x64",
             "arm64"
           ]
+        },
+        {
+          "target": "tar.gz",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
         }
       ],
-      "icon": "build/icon.png"
+      "icon": "static/icons/icon.png",
+      "category": "Game",
+      "maintainer": "EvilLite <atapifire@users.noreply.github.com>",
+      "synopsis": "Filterable world map and mod client for EvilQuest",
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "desktop": {
+        "entry": {
+          "Name": "EvilLite",
+          "Categories": "Game;"
+        }
+      }
     },
     "nsis": {
       "artifactName": "${productName}-Setup-${version}.${ext}",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
-      "installerIcon": "build/icon.ico",
-      "uninstallerIcon": "build/icon.ico",
-      "uninstallDisplayName": "RyeLite",
+      "installerIcon": "static/icons/icon.ico",
+      "uninstallerIcon": "static/icons/icon.ico",
+      "uninstallDisplayName": "EvilLite",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "RyeLite"
+      "shortcutName": "EvilLite"
     }
   },
+  "//deps-note": "Only packages the MAIN/PRELOAD process loads at runtime (externalized by electron-vite) belong here — electron-builder copies production deps into the app. Everything the RENDERER uses is bundled by Vite, so it lives in devDependencies and must NOT be added here (notably @babylonjs/core: ~348MB, loaded at runtime via the import map/CDN, not node_modules).",
   "dependencies": {
-    "@babylonjs/core": "^8.28.1",
     "@electron-toolkit/preload": "^3.0.2",
     "@electron-toolkit/utils": "^4.0.0",
-    "@evillite/core": "workspace:*",
-    "@iconify/iconify": "^3.1.1",
     "electron-log": "^5.4.2",
-    "electron-updater": "^6.6.7",
-    "idb": "^8.0.3",
-    "interactjs": "^1.10.27"
+    "electron-updater": "^6.6.7"
   },
   "devDependencies": {
+    "@babylonjs/core": "^8.28.1",
     "@electron-toolkit/tsconfig": "^1.0.1",
+    "@evillite/core": "workspace:*",
+    "@iconify/iconify": "^3.1.1",
     "@types/node": "^22.17.1",
     "electron": "^37.2.6",
     "electron-builder": "^26.1.0",
     "electron-vite": "^4.0.0",
+    "idb": "^8.0.3",
+    "interactjs": "^1.10.27",
     "prettier": "^3.6.2",
     "ts-simple-nameof": "^1.3.3",
     "typescript": "^5.9.2",

@@ -175,6 +175,11 @@ ipcMain.handle('settings:apply', async (_event, newSettings) => {
     try {
     // Expect newSettings as a full schema JSON string
     await settingsService.saveFromSchemaJSON(String(newSettings));
+        // Let open windows (the client) live-apply settings that don't need a restart,
+        // e.g. the window Layout Mode / titlebar auto-hide.
+        BrowserWindow.getAllWindows().forEach((w) => {
+            try { w.webContents.send('settings:applied'); } catch { /* window closing */ }
+        });
         return true;
     } catch (e) {
         console.error('Failed to save settings:', e);

@@ -1,0 +1,136 @@
+name: Build EvilLite (Linux / Windows / macOS)
+
+# Cross-platform builds happen on native runners — Windows installers need Windows
+# (or Wine), and macOS .dmg / universal / code-signing are macOS-only. A single Linux
+# box can only build Linux, so this matrix is how we produce all three.
+#
+# Run manually (Actions → this workflow → Run), or it runs on a v* tag. Artifacts are
+# attached to the run for testers to download; on a tag it also drafts a GitHub Release.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: windows-latest
+            platform: win
+          - os: macos-latest
+            platform: mac
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enable Corepack (Yarn 4)
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      # The World Map plugin's source of truth is its own repo. Pull BOTH the plugin
+      # source and its prebaked icon cache from there so packaged builds bundle the
+      # current plugin (the copy tracked in this fork can lag) and ship the icons
+      # instead of regenerating them at runtime. Best-effort: build still works without.
+      - name: Sync World Map plugin + prebaked cache from the plugin repo
+        run: |
+          git clone --depth 1 https://github.com/atapifire/evillite-worldmap.git /tmp/wm || exit 0
+          cp /tmp/wm/src/WorldMapPlugin.ts packages/client/src/renderer/client/plugins/WorldMapPlugin.ts 2>/dev/null || true
+          mkdir -p packages/client/src/renderer/client/plugins/data
+          cp /tmp/wm/data/*.json packages/client/src/renderer/client/plugins/data/ 2>/dev/null || true
+
+      # Temp core plugins (until the Plugin Hub installs them) also live in their own repos.
+      - name: Sync Collection Log plugin from its repo
+        run: |
+          git clone --depth 1 https://github.com/atapifire/evillite-collectionlog.git /tmp/cl || exit 0
+          cp /tmp/cl/src/CollectionLogPlugin.ts packages/client/src/renderer/client/plugins/CollectionLogPlugin.ts 2>/dev/null || true
+
+      - name: Build core
+        run: yarn workspace @evillite/core build
+
+      - name: Build client (renderer + main + copy plugin cache)
+        run: yarn workspace @evillite/client build
+
+      - name: Package (${{ matrix.platform }})
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Build unsigned for tester handoff. Add signing creds + flip this on later.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          EV=$(node -p "require('electron/package.json').version")
+          echo "Packaging with electron $EV"
+          yarn workspace @evillite/client exec electron-builder \
+            --${{ matrix.platform }} -c.electronVersion="$EV" --publish never
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: evillite-${{ matrix.platform }}
+          if-no-files-found: warn
+          path: |
+            packages/client/dist/*.AppImage
+            packages/client/dist/*.deb
+            packages/client/dist/*.tar.gz
+            packages/client/dist/*.exe
+            packages/client/dist/*.dmg
+            packages/client/dist/*.zip
+            packages/client/dist/*.blockmap
+            packages/client/dist/*.yml
+            # Every platform emits an identically-named builder-debug.yml; uploading all
+            # three collides on the same release asset name and fails the release job. It's
+            # an electron-builder debug dump testers don't need — exclude it.
+            !packages/client/dist/builder-debug.yml
+
+  # On a v* tag, gather every platform's installers into one GitHub Release so testers
+  # have permanent public download links (and electron-updater has its latest*.yml feed).
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          draft: false
+          # Tags with a pre-release suffix (e.g. v0.2.0-beta.1) publish as pre-releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          body: |
+            Automated cross-platform build. **Unsigned**, so you'll see a one-time OS warning.
+
+            ### Install
+            - **Windows** — `EvilLite-Setup-*.exe`. SmartScreen → *More info* → *Run anyway*.
+            - **macOS** — `*.dmg` (use `arm64` for Apple Silicon, the plain one for Intel).
+              Drag to Applications, then right-click the app → *Open* the first time
+              (or `xattr -dr com.apple.quarantine /Applications/EvilLite.app`).
+            - **Linux — easiest:** `*.deb` → `sudo apt install ./EvilLite-*.deb`, then launch
+              **EvilLite** from your apps menu. No flags, no extra packages.
+            - **Linux — portable:** `*.AppImage` or `*.tar.gz`. On modern distros these may need
+              `--no-sandbox` (and the AppImage needs `libfuse2`); the `.deb` avoids both.
+
+            `arm64` files are for ARM machines (Apple Silicon, ARM Linux); the others are x64/Intel.

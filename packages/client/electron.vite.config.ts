@@ -20,6 +20,11 @@ export default defineConfig(({ mode }) => {
       },
       ...(isDev && {
         server: {
+          hmr: {
+            protocol: 'ws',
+            host: 'localhost',
+            port: 5173
+          },
           fs: {
             allow: ['..']
           },
@@ -27,27 +32,11 @@ export default defineConfig(({ mode }) => {
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
             'Access-Control-Allow-Headers': 'Origin, X-Requested-With, Content-Type, Accept'
-          },
-          proxy: {
-            '/socket.io': {
-              target: 'https://server1.highspell.com:8888',
-              changeOrigin: true,
-              secure: true,
-              headers: {
-                'Origin': 'https://highspell.com',
-                'Referer': 'https://highspell.com/'
-              }
-            },
-            '/api': {
-              target: 'https://highspell.com',
-              changeOrigin: true,
-              secure: true,
-              headers: {
-                'Origin': 'https://highspell.com',
-                'Referer': 'https://highspell.com/'
-              }
-            }
           }
+          // No Vite proxy: EvilLite loads evilquest.net (game, /api, /oauth, WS) through the
+          // main-process protocol/webRequest handler, not the dev server. The inherited
+          // RyeLite/HighLite proxy pointed /api + /socket.io at highspell.com and only caused
+          // proxy errors here, so it's removed.
         }
       }),
       publicDir: resolve(__dirname, "static"),

@@ -104,6 +104,28 @@ export class settingsSchema extends SettingsSchema {
                 } as DropdownField
             ]
         },
+        Display: {
+            heading: "Display",
+            fields: [
+                {
+                    label: "Layout Mode",
+                    type: SettingTypes.DROPDOWN,
+                    description: "Reserve Space: the game shrinks to leave room for the titlebar (top) and plugin sidebar (right) — RuneLite-style. Overlay: the titlebar and sidebar float on top of the full-window game.",
+                    default: "Reserve Space",
+                    options: {
+                        "Reserve Space": "Reserve Space",
+                        "Overlay": "Overlay"
+                    },
+                    validation: (value) => ["Reserve Space", "Overlay"].includes(value as string),
+                } as DropdownField,
+                {
+                    label: "Auto-hide Titlebar",
+                    type: SettingTypes.BOOLEAN,
+                    description: "ON: the titlebar slides away until you move the cursor to the very top of the window. OFF (default): the titlebar stays visible.",
+                    default: false
+                } as Field
+            ]
+        },
         Plugins: {
             heading: "Plugin Settings",
             fields: [
@@ -117,6 +139,17 @@ export class settingsSchema extends SettingsSchema {
                     label: "Allow Beta Plugins",
                     type: SettingTypes.BOOLEAN,
                     description: "Allow the use of beta plugins in Ryelite.",
+                    default: false
+                } as Field
+            ]
+        },
+        Login: {
+            heading: "Login",
+            fields: [
+                {
+                    label: "Clear reCAPTCHA session each launch",
+                    type: SettingTypes.BOOLEAN,
+                    description: "ON: wipe Google's reCAPTCHA cookies/cache on every launch (a fresh, cold session — useful if a session got flagged). OFF (recommended): keep the cookie so reCAPTCHA builds trust across logins and scores you higher over time.",
                     default: false
                 } as Field
             ]

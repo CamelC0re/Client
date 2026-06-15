@@ -108,6 +108,16 @@ yarn build:mac    # Build macOS application (.dmg)
 yarn build:linux  # Build Linux AppImage
 ```
 
+### Test the built client (local)
+CI lives on the canonical repo and only runs on a PR/tag, so build + test packaged builds locally:
+```bash
+yarn sync:plugin  # Pull the World Map plugin + prebaked cache into the tree (mirrors CI)
+yarn try          # Build the packaged app (unpacked) and launch it — fastest "built client" test
+yarn dist         # Build a full installer for your OS (.deb/.exe/.dmg) into dist/
+```
+`yarn try` / `yarn dist` auto-sync the plugin first. See **[RELEASING.md](../../RELEASING.md)** for the
+branch model (dev/main), release channels (beta → Beta, clean tag → Stable), and how to cut a release.
+
 ### Code Quality
 ```bash
 yarn format       # Format code with Prettier

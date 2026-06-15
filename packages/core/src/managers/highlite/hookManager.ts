@@ -35,6 +35,12 @@ export class HookManager {
     }
 
     public registerClass(className: string, mappedName: string): boolean {
+        // Idempotent: if this class is already bound, skip. Re-binding would wrap its
+        // prototype methods a second time (hooks would fire twice). This lets the
+        // Reflector parse safely re-run to pick up classes that chunk-loaded late,
+        // without rewrapping anything already hooked.
+        if (document.highlite.gameHooks[mappedName]) return true;
+
         const classInstance = document.client.get(className);
 
         if (!classInstance) {
@@ -96,15 +102,13 @@ export class HookManager {
         const self = this;
         const targetClass = document.highlite.gameHooks[sourceClass];
         if (!targetClass) {
-            console.warn(`[EvilLite] Class ${sourceClass} not found in game hooks.`);
+            // console.warn(`[EvilLite] Class ${sourceClass} not found in game hooks.`);
             return false;
         }
 
         const classObject = targetClass.prototype;
         if (!classObject) {
-            console.warn(
-                `[EvilLite] Attempted to register unknown client class hook (${sourceClass}).`
-            );
+            // console.warn(`[EvilLite] Attempted to register unknown client class hook (${sourceClass}).`);
             return false;
         }
 
@@ -116,6 +120,13 @@ export class HookManager {
         const hookName = `${sourceClass}_${functionName}`;
         (function (originalFunction: any) {
             classObject[fnName] = function (...args: Array<unknown>) {
+                // Capture the live instance for classes that aren't game-side singletons
+                // (e.g. GameManager exposes itself only via window.gm). Lets plugins read
+                // document.highlite.gameHooks.<Name>.Instance uniformly instead of reaching
+                // into raw globals. No-op for classes that already expose a static Instance.
+                if (targetClass.Instance === undefined) {
+                    try { targetClass.Instance = this; } catch { /* getter-only — leave it */ }
+                }
                 const originalReturn = originalFunction.apply(this, arguments);
                 hookFn.apply(self, [hookName, ...args, this]);
                 return originalReturn;
@@ -133,15 +144,13 @@ export class HookManager {
         const self = this;
         const targetClass = document.highlite.gameHooks[sourceClass];
         if (!targetClass) {
-            console.warn(`[EvilLite] Class ${sourceClass} not found in game hooks.`);
+            // console.warn(`[EvilLite] Class ${sourceClass} not found in game hooks.`);
             return false;
         }
 
         const classObject = targetClass.prototype;
         if (!classObject) {
-            console.warn(
-                `[EvilLite] Attempted to register unknown client class override hook (${sourceClass}).`
-            );
+            // console.warn(`[EvilLite] Attempted to register unknown client class override hook (${sourceClass}).`);
             return false;
         }
 
@@ -168,9 +177,7 @@ export class HookManager {
         const classObject = document.highlite.gameHooks[sourceClass];
 
         if (!classObject) {
-            console.warn(
-                `[EvilLite] Attempted to register unknown static client class hook (${sourceClass}).`
-            );
+            // console.warn(`[EvilLite] Attempted to register unknown static client class hook (${sourceClass}).`);
             return false;
         }
 

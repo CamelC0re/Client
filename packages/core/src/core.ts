@@ -62,6 +62,15 @@ export class Highlite {
         this.settingsManager = new SettingsManager();
         this.databaseManager = new DatabaseManager();
         this.pluginDataManager = new PluginDataManager();
+
+        // Register the core sidebar icons (Plugin Hub, Settings) at page load so the sidebar
+        // is populated on the main menu / logged out, and these sit before plugin icons.
+        // Their content is still built later (Hub in start(), Settings on login). Guarded so
+        // the login-time init reuses these instead of re-registering.
+        try {
+            this.pluginManager.ensureHubIcon();
+            this.settingsManager.ensureSettingsIcon();
+        } catch (e) { console.warn('[EvilLite] early sidebar icon registration failed', e); }
     }
 
 

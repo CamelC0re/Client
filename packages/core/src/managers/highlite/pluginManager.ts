@@ -58,6 +58,8 @@ export class PluginManager {
         this.isLoggedIn = isLoggedIn;
     };
 
+    private hubIconReady = false;
+
     constructor() {
         if (PluginManager.instance) return PluginManager.instance;
         if (document.highlite.managers.PluginManager) {
@@ -68,8 +70,17 @@ export class PluginManager {
         document.highlite.managers.PluginManager = this;
     }
 
-    async initialize() {
+    /** Register the Plugin Hub sidebar icon (and its empty content panel) at page load, so
+     *  it's visible on the main menu / logged out and ordered before plugin icons. The hub
+     *  content is still populated later in initialize(). Idempotent. */
+    ensureHubIcon() {
+        if (this.hubIconReady) return;
         this.panelContent = this.panelManager.requestMenuItem('🗃️', 'Plugin Hub')[1] as HTMLDivElement;
+        this.hubIconReady = true;
+    }
+
+    async initialize() {
+        this.ensureHubIcon();
         this.panelContent.style.display = 'flex';
         this.panelContent.style.flexDirection = 'column';
         this.panelContent.style.padding = '8px';
