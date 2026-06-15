@@ -55,6 +55,12 @@ jobs:
           mkdir -p packages/client/src/renderer/client/plugins/data
           cp /tmp/wm/data/*.json packages/client/src/renderer/client/plugins/data/ 2>/dev/null || true
 
+      # Temp core plugins (until the Plugin Hub installs them) also live in their own repos.
+      - name: Sync Collection Log plugin from its repo
+        run: |
+          git clone --depth 1 https://github.com/atapifire/evillite-collectionlog.git /tmp/cl || exit 0
+          cp /tmp/cl/src/CollectionLogPlugin.ts packages/client/src/renderer/client/plugins/CollectionLogPlugin.ts 2>/dev/null || true
+
       - name: Build core
         run: yarn workspace @evillite/core build
 
