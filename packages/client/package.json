@@ -49,7 +49,7 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "atapifire",
+        "owner": "Metsutan",
         "repo": "EvilLite"
       }
     ],
