@@ -16,10 +16,6 @@ import com.getcapacitor.BridgeActivity;
  */
 public class MainActivity extends BridgeActivity {
     static final String ENTRY_URL = "https://evilquest.net/__evillite__/client.html";
-    // Placeholder; finalise against a real device UA during the spike (reCAPTCHA cares).
-    static final String MOBILE_CHROME_UA =
-        "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36";
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
@@ -31,7 +27,10 @@ public class MainActivity extends BridgeActivity {
         cm.setAcceptCookie(true);
         cm.setAcceptThirdPartyCookies(webView, true);
 
-        webView.getSettings().setUserAgentString(MOBILE_CHROME_UA);
+        // NO User-Agent override: we present the WebView's REAL device identity (honest +
+        // consistent with the underlying Client Hints), mirroring the desktop "consistency,
+        // not spoofing" principle. Spoofing a different device is exactly what trips anti-abuse
+        // false positives. Login itself runs in the system browser, so reCAPTCHA sees real Chrome.
 
         // Native OAuth (RFC 8252 loopback + system browser). The injected ELECTRON_SHIM routes
         // window.electron.ipcRenderer's oauth:* channels to this `EvilLiteNative` object.
