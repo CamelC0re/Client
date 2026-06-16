@@ -45,38 +45,54 @@ packages/mobile/
   scripts/build-web.mjs   # stages the client renderer into www/public/ (APK assets)
   www/index.html          # Capacitor-required entry; only shows if navigation failed
   android-template/       # native files to drop into the generated android/ project:
-    .../MainActivity.kt           # installs the interceptor, points WebView at the entry URL
-    .../EvilLiteWebViewClient.kt  # the shouldInterceptRequest MITM (serve-local + rewrite-JS)
+    .../MainActivity.java           # installs the interceptor, points WebView at the entry URL
+    .../EvilLiteWebViewClient.java  # the shouldInterceptRequest MITM (serve-local + rewrite-JS)
+  android-env.sh          # sources JDK 17 + Android SDK from ~ (no sudo) — see below
   SPIKE.md
 ```
 
 The native `android/` project itself is **generated** by `npx cap add android` (gitignored);
-the `android-template/` files are copied into it (see steps below).
+the `android-template/` files are copied into it (see steps below). Java, not Kotlin, so no extra
+Gradle plugin is needed (Capacitor's app module is Java by default).
 
-## Build an APK (on a machine with Android Studio / SDK)
+## Toolchain (no sudo — installs into your home dir)
 
 ```bash
-# from packages/mobile
+# JDK 17
+curl -sL "https://api.adoptium.net/v3/binary/latest/17/ga/linux/x64/jdk/hotspot/normal/eclipse?project=jdk" \
+  -o /tmp/jdk17.tgz && mkdir -p ~/opt && tar xzf /tmp/jdk17.tgz -C ~/opt
+# Android SDK command-line tools + packages
+curl -sL "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -o /tmp/cmdtools.zip
+mkdir -p ~/Android/Sdk/cmdline-tools && unzip -q /tmp/cmdtools.zip -d ~/Android/Sdk/cmdline-tools
+mv ~/Android/Sdk/cmdline-tools/cmdline-tools ~/Android/Sdk/cmdline-tools/latest
+source packages/mobile/android-env.sh
+yes | sdkmanager --licenses
+sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+```
+
+## Build an APK
+
+```bash
+cd packages/mobile
+source android-env.sh                 # JAVA_HOME + ANDROID_HOME (no sudo)
 yarn install
 
 # 1. Build the renderer and stage it into www/public
 yarn workspace @evillite/client build
 yarn build:web
 
-# 2. Generate the native Android project
+# 2. Generate the native Android project + drop in the EvilLite native files
 npx cap add android
+cp android-template/app/src/main/java/net/evilquest/evillite/*.java \
+   android/app/src/main/java/net/evilquest/evillite/   # overwrites the generated stub MainActivity
+echo "sdk.dir=$ANDROID_HOME" > android/local.properties
 
-# 3. Drop in the EvilLite native files (overwrites the generated MainActivity)
-cp android-template/app/src/main/java/net/evilquest/evillite/*.kt \
-   android/app/src/main/java/net/evilquest/evillite/
+# 3. Build a debug APK
+npx cap sync android
+cd android && ./gradlew assembleDebug   # → app/build/outputs/apk/debug/app-debug.apk
 
-# 4. Build a debug APK
-yarn cap:sync
-yarn apk:debug      # → android/app/build/outputs/apk/debug/app-debug.apk
-#   or: yarn cap:open  (open in Android Studio and Run on a device)
-
-# 5. Sideload
-adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+# 4. Sideload onto a plugged-in phone (USB debugging on)
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
 ## Risks to validate on-device (the point of the spike)
