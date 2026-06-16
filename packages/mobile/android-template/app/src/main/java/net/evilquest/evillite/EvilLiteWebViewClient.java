@@ -40,6 +40,28 @@ import java.util.regex.Pattern;
 public class EvilLiteWebViewClient extends BridgeWebViewClient {
     private static final Pattern CLASS_RE = Pattern.compile("\\bclass\\s+([A-Za-z0-9_]+)");
 
+    // The renderer is built for Electron and expects window.electron (the @electron-toolkit
+    // preload: ipcRenderer, process, webFrame). There is no preload in a WebView, so we inject
+    // a minimal stub into the served HTML before the renderer's modules run. ipcRenderer is a
+    // no-op (asset-cache load resolves to {} → icons blank until a Capacitor Filesystem backend
+    // lands; see SPIKE.md). This unblocks the bootstrap.
+    private static final String ELECTRON_SHIM =
+        "(function(){var noop=function(){};" +
+        "var ipc={send:noop,sendSync:function(){return null;},postMessage:noop," +
+        "on:function(){return ipc;},once:function(){return ipc;},off:function(){return ipc;}," +
+        "addListener:function(){return ipc;},removeListener:function(){return ipc;}," +
+        "removeAllListeners:function(){return ipc;},invoke:function(){return Promise.resolve(undefined);}};" +
+        "if(!window.electron){window.electron={ipcRenderer:ipc," +
+        "process:{platform:'android',env:{},versions:{},argv:[]}," +
+        "webFrame:{setZoomFactor:noop,setZoomLevel:noop,getZoomLevel:function(){return 0;},getZoomFactor:function(){return 1;}}};}" +
+        "if(!window.process){window.process={platform:'android',env:{},versions:{},argv:[],nextTick:function(f){setTimeout(f,0);}};}" +
+        // window.settings + window.screenshot are the other two preload globals (exposeInMainWorld).
+        "if(!window.settings){window.settings={getAll:function(){return Promise.resolve({});}," +
+        "getByName:function(){return Promise.resolve(undefined);},set:function(){return Promise.resolve();}," +
+        "selectDirectory:function(){return Promise.resolve(null);}};}" +
+        "if(!window.screenshot){window.screenshot={capture:function(){return Promise.resolve(null);}};}" +
+        "})();";
+
     public EvilLiteWebViewClient(Bridge bridge) {
         super(bridge);
     }
@@ -58,6 +80,12 @@ public class EvilLiteWebViewClient extends BridgeWebViewClient {
                     InputStream stream = view.getContext().getAssets().open(asset);
                     Map<String, String> h = new HashMap<>();
                     h.put("Access-Control-Allow-Origin", "*");
+                    if (asset.endsWith(".html")) {
+                        // Inject the electron preload shim before the renderer's scripts run.
+                        String html = injectShim(readAll(stream));
+                        return new WebResourceResponse("text/html", "UTF-8", 200, "OK", h,
+                            new ByteArrayInputStream(html.getBytes(StandardCharsets.UTF_8)));
+                    }
                     return new WebResourceResponse(mimeOf(asset), "UTF-8", 200, "OK", h, stream);
                 } catch (Exception e) {
                     return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found",
@@ -116,6 +144,23 @@ public class EvilLiteWebViewClient extends BridgeWebViewClient {
         h.put("Cache-Control", "no-store, must-revalidate");
         return new WebResourceResponse("application/javascript", "UTF-8", 200, "OK", h,
             new ByteArrayInputStream(sb.toString().getBytes(StandardCharsets.UTF_8)));
+    }
+
+    private static String readAll(InputStream in) throws Exception {
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader r = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+            char[] buf = new char[8192];
+            int n;
+            while ((n = r.read(buf)) != -1) sb.append(buf, 0, n);
+        }
+        return sb.toString();
+    }
+
+    private String injectShim(String html) {
+        String tag = "<script>" + ELECTRON_SHIM + "</script>";
+        int i = html.indexOf("<head>");
+        if (i >= 0) return html.substring(0, i + 6) + tag + html.substring(i + 6);
+        return tag + html;
     }
 
     private String mimeOf(String p) {
