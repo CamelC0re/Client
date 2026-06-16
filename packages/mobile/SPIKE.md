@@ -22,13 +22,28 @@ Booting the APK reached, in order (logcat / screenshots):
 So the two big unknowns — interception and the Reflector — are **answered: they work.** The shim
 (`ELECTRON_SHIM` in EvilLiteWebViewClient) is how a WebView stands in for the Electron preload.
 
+## Login: WORKS on a real device (validated on a Galaxy S22)
+The native `OAuthBridge` runs the RFC 8252 loopback flow through the **system browser**, so reCAPTCHA
+runs in real Chrome — and a real phone scores fine (an **emulator scores too low**, so the AVD can't
+finish login; use a device). Two device-specific fixes were needed:
+- **Token exchange in the foreground.** The browser doesn't auto-return from a loopback redirect, and
+  Android/Samsung restricts background DNS — so the native `/oauth/token` POST failed with
+  `UnknownHostException` while the app was backgrounded. Fix: bring the app to front on the callback +
+  **retry the exchange for ~20s** so it completes once foregrounded.
+- **Keep the post-login reload in the WebView.** `window.location.reload()` after login was punted to
+  an external browser by Capacitor (evilquest.net is "external" to the localhost app) → client.html
+  404. Fix: override `shouldOverrideUrlLoading` to keep evilquest.net navigation in the WebView.
+
 ## Still open (next child issues)
-- **Login**: the OAuth "Authorize" button opens the system browser on desktop; on mobile it needs
-  Capacitor Browser / AppAuth + a redirect back into the app. Until then you can't get past login.
-  reCAPTCHA-from-a-Web-UA remains the consistency risk to watch.
-- **`PluginAssetCache` on mobile**: the shim's `ipcRenderer.invoke` returns undefined → caches load
-  empty → model-icons/terrain are blank. A Capacitor Filesystem (or "serve the bundled JSON via the
-  interceptor") backend restores them.
+- **Auto-return after login** (UX): Android 12+ blocks an app from foregrounding itself from the
+  background, so the user must swipe back manually. Proper fix = a **custom-scheme / App Link redirect**
+  (`evillite://oauth/callback`) so the browser launches the app — but the OAuth **server must whitelist
+  that redirect_uri** (today it only allows the 127.0.0.1 loopback). Coordinate with the EQ devs.
+- **`PluginAssetCache` on mobile**: the shim's `ipcRenderer.invoke` returns undefined for the cache →
+  model-icons/terrain load empty. A Capacitor Filesystem backend (or serve the bundled JSON via the
+  interceptor) restores them.
+- reCAPTCHA-from-a-mobile-WebView is moot for login (system browser handles it), but watch it for any
+  in-game flows that re-trigger it.
 
 ## The one finding that matters
 

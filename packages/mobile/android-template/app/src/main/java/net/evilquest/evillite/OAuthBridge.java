@@ -155,6 +155,10 @@ public class OAuthBridge {
                 if (cs[2] != null) throw new Exception("authorize error: " + cs[2]);
                 if (cs[0] == null) throw new Exception("no authorization code in callback");
                 if (!state.equals(cs[1])) throw new Exception("state mismatch (possible CSRF)");
+                // Return to the app: the system browser doesn't auto-switch back from a loopback
+                // redirect, and Android/Samsung restricts background DNS, so the token exchange has
+                // to run with the app foregrounded.
+                bringAppToForeground();
                 return tokenRequest(form(
                     "grant_type", "authorization_code",
                     "client_id", CLIENT_ID,
@@ -206,9 +210,35 @@ public class OAuthBridge {
         ctx.startActivity(i);
     }
 
+    /** Best-effort bring our (singleTask) activity to the front after the OAuth redirect. */
+    private void bringAppToForeground() {
+        try {
+            Intent i = ctx.getPackageManager().getLaunchIntentForPackage(ctx.getPackageName());
+            if (i != null) {
+                i.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_NEW_TASK);
+                ctx.startActivity(i);
+            }
+        } catch (Exception ignored) { /* background-launch may be blocked; the retry covers it */ }
+    }
+
     // ── token endpoint + persistence ───────────────────────────────────────────
 
+    /** Exchange/refresh with a retry window: a background launch can race DNS for ~seconds while
+     *  the app comes to the foreground, so retry UnknownHost/connect failures for ~20s. */
     private JSONObject tokenRequest(String body) throws Exception {
+        Exception last = null;
+        for (int attempt = 0; attempt < 28; attempt++) {
+            try {
+                return tokenRequestOnce(body);
+            } catch (java.net.UnknownHostException | java.net.ConnectException | java.net.SocketTimeoutException e) {
+                last = e;
+                try { Thread.sleep(750); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+            }
+        }
+        throw last != null ? last : new Exception("token request failed");
+    }
+
+    private JSONObject tokenRequestOnce(String body) throws Exception {
         HttpURLConnection conn = (HttpURLConnection) new URL(TOKEN).openConnection();
         conn.setRequestMethod("POST");
         conn.setDoOutput(true);
