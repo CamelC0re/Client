@@ -97,10 +97,67 @@ jobs:
             # an electron-builder debug dump testers don't need — exclude it.
             !packages/client/dist/builder-debug.yml
 
+  # Android APK (Capacitor mobile shell). Separate from the desktop matrix — it needs the JDK +
+  # Android SDK, not electron-builder. Produces an unsigned debug APK testers can sideload.
+  android:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Enable Corepack (Yarn 4)
+        run: corepack enable
+      - name: Install dependencies
+        run: yarn install --immutable
+      # Same temp plugin sync as the desktop build (until the Plugin Hub installs them).
+      - name: Sync World Map plugin + prebaked cache
+        run: |
+          git clone --depth 1 https://github.com/atapifire/evillite-worldmap.git /tmp/wm || exit 0
+          cp /tmp/wm/src/WorldMapPlugin.ts packages/client/src/renderer/client/plugins/WorldMapPlugin.ts 2>/dev/null || true
+          mkdir -p packages/client/src/renderer/client/plugins/data
+          cp /tmp/wm/data/*.json packages/client/src/renderer/client/plugins/data/ 2>/dev/null || true
+      - name: Sync Collection Log plugin
+        run: |
+          git clone --depth 1 https://github.com/atapifire/evillite-collectionlog.git /tmp/cl || exit 0
+          cp /tmp/cl/src/CollectionLogPlugin.ts packages/client/src/renderer/client/plugins/CollectionLogPlugin.ts 2>/dev/null || true
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Build core + renderer
+        run: |
+          yarn workspace @evillite/core build
+          yarn workspace @evillite/client build
+      - name: Build debug APK
+        working-directory: packages/mobile
+        run: |
+          node scripts/build-web.mjs
+          npx cap add android
+          cp android-template/app/src/main/java/net/evilquest/evillite/*.java \
+             android/app/src/main/java/net/evilquest/evillite/
+          echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+          npx cap sync android
+          (cd android && ./gradlew assembleDebug --no-daemon)
+          mkdir -p out-apk
+          cp android/app/build/outputs/apk/debug/app-debug.apk out-apk/EvilLite-android-debug.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: evillite-android
+          if-no-files-found: warn
+          path: packages/mobile/out-apk/*.apk
+
   # On a v* tag, gather every platform's installers into one GitHub Release so testers
   # have permanent public download links (and electron-updater has its latest*.yml feed).
   release:
-    needs: build
+    needs: [build, android]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -132,5 +189,7 @@ jobs:
               **EvilLite** from your apps menu. No flags, no extra packages.
             - **Linux — portable:** `*.AppImage` or `*.tar.gz`. On modern distros these may need
               `--no-sandbox` (and the AppImage needs `libfuse2`); the `.deb` avoids both.
+            - **Android** — `EvilLite-android-debug.apk`. Sideload it (enable *Install unknown apps*).
+              Unsigned debug build; log in with your EvilQuest account in the system browser.
 
             `arm64` files are for ARM machines (Apple Silicon, ARM Linux); the others are x64/Intel.
