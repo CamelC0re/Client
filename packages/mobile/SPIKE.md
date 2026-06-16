@@ -1,10 +1,34 @@
 # EvilLite Mobile — Android Spike
 
-Status: **scaffold + feasibility proof.** No APK is built here (this machine has no Android
-SDK/JDK/Gradle). This documents the architecture, ships the hard part (the JS-rewrite
-interceptor), and gives you the exact steps to produce an APK on a machine with Android Studio.
+Status: **VALIDATED on an emulator — the full client loads to the EvilQuest login screen.**
+APK builds (Java interceptor, no Kotlin plugin), installs, and runs on an Android-14 AVD; the
+renderer, the JS-rewrite interception, the game-script injection and Babylon.js (WebGL2) all work.
+The remaining gap is login (OAuth/reCAPTCHA from a mobile WebView).
 
 Tracking: Metsutan/EvilLite **#4** (spike), under epic **#2**.
+
+## What was proven on-device (Android 14 AVD)
+
+Booting the APK reached, in order (logcat / screenshots):
+1. interceptor serves `/__evillite__/client.html` from assets ✅
+2. renderer loads — but needs Electron preload globals it doesn't have in a WebView. We inject a
+   shim into the served HTML for the three `exposeInMainWorld` globals: **`electron`** (ipcRenderer/
+   process/webFrame), **`settings`**, **`screenshot`** ✅
+3. `[EvilLite] OAuth auto-login: no session` → `Found 1 scripts in /play HTML` →
+   `Script injection complete` → `Preparing game client interception...` ✅ (the Reflector path works)
+4. `Babylon.js v7.54.3 - WebGL2` ✅ (game engine initialises under software GL)
+5. **EvilQuest login screen renders** with the "Authorize EvilLite Login" (OAuth) button ✅
+
+So the two big unknowns — interception and the Reflector — are **answered: they work.** The shim
+(`ELECTRON_SHIM` in EvilLiteWebViewClient) is how a WebView stands in for the Electron preload.
+
+## Still open (next child issues)
+- **Login**: the OAuth "Authorize" button opens the system browser on desktop; on mobile it needs
+  Capacitor Browser / AppAuth + a redirect back into the app. Until then you can't get past login.
+  reCAPTCHA-from-a-Web-UA remains the consistency risk to watch.
+- **`PluginAssetCache` on mobile**: the shim's `ipcRenderer.invoke` returns undefined → caches load
+  empty → model-icons/terrain are blank. A Capacitor Filesystem (or "serve the bundled JSON via the
+  interceptor") backend restores them.
 
 ## The one finding that matters
 
