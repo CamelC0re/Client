@@ -33,6 +33,10 @@ public class MainActivity extends BridgeActivity {
 
         webView.getSettings().setUserAgentString(MOBILE_CHROME_UA);
 
+        // Native OAuth (RFC 8252 loopback + system browser). The injected ELECTRON_SHIM routes
+        // window.electron.ipcRenderer's oauth:* channels to this `EvilLiteNative` object.
+        webView.addJavascriptInterface(new OAuthBridge(this, webView), "EvilLiteNative");
+
         // Take over resource loading: serve /__evillite__/* from assets + rewrite game JS.
         webView.setWebViewClient(new EvilLiteWebViewClient(this.bridge));
 
