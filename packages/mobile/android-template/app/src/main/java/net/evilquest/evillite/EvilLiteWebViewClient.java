@@ -63,6 +63,11 @@ public class EvilLiteWebViewClient extends BridgeWebViewClient {
         "if(ch==='oauth:ensure-fresh')return nat('ensureFresh');" +
         "if(ch==='oauth:logout')return nat('logout');" +
         "if(ch==='oauth:status')return nat('status');" +
+        // PluginAssetCache backend on mobile: serve the desktop-baked cache that's bundled in the
+        // APK (assets/public/plugins-data/<ns>.json, served by the interceptor). This gives the map
+        // its prebaked model-icons + terrain so it never renders icons live (which spun up a second
+        // Babylon/WebGL context and blanked the game's 3D view).
+        "if(ch==='plugin-asset-cache:load'){var ns=arguments[1];return fetch('/__evillite__/plugins-data/'+ns+'.json').then(function(r){return r.ok?r.json():null;}).then(function(j){return (j&&j.entries)||{};}).catch(function(){return {};});}" +
         "return Promise.resolve(undefined);}," +
         "send:function(ch){var n=N();if(!n)return;try{if(ch==='oauth:heartbeat')n.heartbeat();else if(ch==='oauth:logged-out')n.loggedOut();}catch(e){}}," +
         "sendSync:function(ch){var n=N();if(n&&ch==='oauth:logged-out'){try{return n.loggedOut();}catch(e){}}return null;}};" +
