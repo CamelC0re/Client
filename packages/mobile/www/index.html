@@ -1,0 +1,17 @@
+<!doctype html>
+<!--
+  Capacitor requires a webDir with an index.html. The EvilLite shell does NOT actually
+  load this file — MainActivity navigates the WebView to https://evilquest.net/__evillite__/client.html
+  and EvilLiteWebViewClient serves the real renderer from assets/public/. This page only
+  shows if interception/navigation failed, so it doubles as a failure indicator.
+-->
+<html lang="en">
+  <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" /><title>EvilLite</title></head>
+  <body style="margin:0;background:#1a1612;color:#e8dfce;font:14px system-ui;display:grid;place-items:center;height:100vh">
+    <div style="text-align:center">
+      <div style="font-size:32px">📒</div>
+      <p>EvilLite mobile shell didn't reach the game.</p>
+      <p style="color:#8a8070;font-size:12px">If you see this, navigation/interception failed — check logcat.</p>
+    </div>
+  </body>
+</html>
