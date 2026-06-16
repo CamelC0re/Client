@@ -80,6 +80,17 @@ public class EvilLiteWebViewClient extends BridgeWebViewClient {
     }
 
     @Override
+    public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+        // Keep evilquest.net navigations (incl. the post-login window.location.reload() and the
+        // SPA's own routing) INSIDE the WebView, where our interceptor serves them. Capacitor's
+        // default treats evilquest.net as "external" and would punt it to a real browser — which
+        // has no interceptor, so client.html 404s and the in-app client never logs in.
+        String host = request.getUrl().getHost();
+        if ("evilquest.net".equals(host)) return false; // false = let the WebView load it
+        return super.shouldOverrideUrlLoading(view, request);
+    }
+
+    @Override
     public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
         Uri url = request.getUrl();
         String host = url.getHost();
