@@ -27,6 +27,13 @@ public class MainActivity extends BridgeActivity {
         cm.setAcceptCookie(true);
         cm.setAcceptThirdPartyCookies(webView, true);
 
+        // Disable the WebView's built-in pinch-zoom: it was zooming the whole app by accident
+        // (in-game and fighting the map's own pinch handler). The map does its own zoom in JS.
+        android.webkit.WebSettings ws = webView.getSettings();
+        ws.setSupportZoom(false);
+        ws.setBuiltInZoomControls(false);
+        ws.setDisplayZoomControls(false);
+
         // NO User-Agent override: we present the WebView's REAL device identity (honest +
         // consistent with the underlying Client Hints), mirroring the desktop "consistency,
         // not spoofing" principle. Spoofing a different device is exactly what trips anti-abuse

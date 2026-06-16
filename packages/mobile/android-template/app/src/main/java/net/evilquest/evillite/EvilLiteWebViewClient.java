@@ -47,7 +47,9 @@ public class EvilLiteWebViewClient extends BridgeWebViewClient {
     // everything else is a no-op (asset-cache load resolves to undefined → caches empty until a
     // Filesystem backend lands; see SPIKE.md).
     private static final String ELECTRON_SHIM =
-        "(function(){var noop=function(){};var N=function(){return window.EvilLiteNative;};" +
+        // Explicit platform flag plugins can read to adapt for mobile (e.g. overlay-only, no popout).
+        // Also reflected in window.electron.process.platform below ('android').
+        "(function(){window.EvilLiteMobile={platform:'android'};var noop=function(){};var N=function(){return window.EvilLiteNative;};" +
         "var cbN=0,cbM={};" +
         "window.__eqNativeResolve=function(id,res){var f=cbM[id];if(f){delete cbM[id];f(res);}};" +
         "function nat(m){return new Promise(function(res){var n=N();if(!n||typeof n[m]!=='function'){res(undefined);return;}" +
@@ -69,10 +71,16 @@ public class EvilLiteWebViewClient extends BridgeWebViewClient {
         "webFrame:{setZoomFactor:noop,setZoomLevel:noop,getZoomLevel:function(){return 0;},getZoomFactor:function(){return 1;}}};}" +
         "if(!window.process){window.process={platform:'android',env:{},versions:{},argv:[],nextTick:function(f){setTimeout(f,0);}};}" +
         // window.settings + window.screenshot are the other two preload globals (exposeInMainWorld).
+        // getByName('Enable Plugins') gates `new Highlite()` (the whole framework + right-nav +
+        // plugins) in client.ts — must be truthy or none of it initializes on mobile.
         "if(!window.settings){window.settings={getAll:function(){return Promise.resolve({});}," +
-        "getByName:function(){return Promise.resolve(undefined);},set:function(){return Promise.resolve();}," +
+        "getByName:function(n){return Promise.resolve(n==='Enable Plugins'?true:undefined);},set:function(){return Promise.resolve();}," +
         "selectDirectory:function(){return Promise.resolve(null);}};}" +
         "if(!window.screenshot){window.screenshot={capture:function(){return Promise.resolve(null);}};}" +
+        // Android WebView has no Web Notifications API; core's NotificationManager.start() touches
+        // `Notification` and would throw — aborting the ENTIRE login plugin-start (no plugin would
+        // init/start). Stub it so plugin startup completes. (Proper long-term fix: guard it in core.)
+        "if(typeof window.Notification==='undefined'){var EQN=function(){};EQN.permission='denied';EQN.requestPermission=function(){return Promise.resolve('denied');};window.Notification=EQN;}" +
         "})();";
 
     public EvilLiteWebViewClient(Bridge bridge) {
@@ -180,8 +188,63 @@ public class EvilLiteWebViewClient extends BridgeWebViewClient {
         return sb.toString();
     }
 
+    // Mobile UI: auto-hide the titlebar (swipe DOWN from the top edge to reveal; auto-hides) and
+    // the right nav (swipe LEFT from the right edge to reveal; swipe back to hide). Both are made
+    // position:fixed so hiding them gives the game the full viewport. Applied via body classes so
+    // it works regardless of when the renderer creates those elements.
+    // DEFERRED (per api 2026-06-16): keep both bars VISIBLE for now; revisit auto-hide/swipe later.
+    // Not injected (see injectShim) — kept here so it's ready to re-enable.
+    @SuppressWarnings("unused")
+    private static final String MOBILE_UI =
+        "(function(){var css="
+        + "'.highlite_titlebar{position:fixed!important;left:0;right:0;top:0;transition:transform .25s ease}'"
+        + "+'body.eqtb-hidden .highlite_titlebar{transform:translateY(-100%)}'"
+        + "+'.highlite_bar{position:fixed!important;right:0;top:0;height:100%!important;transition:transform .25s ease}'"
+        + "+'.highlite_bar_selected_content{position:fixed!important;right:30px;top:0;height:100%!important;transition:transform .25s ease}'"
+        + "+'body.eqrb-hidden .highlite_bar{transform:translateX(100%)}'"
+        + "+'body.eqrb-hidden .highlite_bar_selected_content{transform:translateX(120%)}';"
+        + "var s=document.createElement('style');s.textContent=css;(document.head||document.documentElement).appendChild(s);"
+        + "function hide(){if(document.body)document.body.classList.add('eqtb-hidden','eqrb-hidden');}"
+        + "if(document.body)hide();else addEventListener('DOMContentLoaded',hide);"
+        + "var EDGE=24,TH=40,sx=0,sy=0,act=null,tbTimer=null;"
+        + "addEventListener('touchstart',function(e){var t=e.touches[0];sx=t.clientX;sy=t.clientY;"
+        + "act=(sy<=EDGE)?'top':(sx>=innerWidth-EDGE?'right':null);},{passive:true});"
+        + "addEventListener('touchend',function(e){if(!act)return;var t=e.changedTouches[0],dx=t.clientX-sx,dy=t.clientY-sy,b=document.body;"
+        + "if(act==='top'&&dy>TH){b.classList.remove('eqtb-hidden');clearTimeout(tbTimer);tbTimer=setTimeout(function(){b.classList.add('eqtb-hidden');},4000);}"
+        + "if(act==='right'&&dx<-TH){b.classList.remove('eqrb-hidden');}"
+        + "if(act==='right'&&dx>TH){b.classList.add('eqrb-hidden');}"
+        + "act=null;},{passive:true});})();";
+
+    // Mobile top-bar: the Electron window controls (minimize/maximize/close) are useless on a phone,
+    // so hide them and replace with a "→" collapse button in the titlebar. Pressing it hides the top
+    // nav + right panel and reveals a small black "←" button in the top-right; pressing that restores
+    // both. State is driven by a body.eq-collapsed class.
+    private static final String MOBILE_TOPBAR =
+        "(function(){var css="
+        + "'#window-controls{display:none!important}'"
+        + "+'.highlite_titlebar{padding-right:46px!important}'"  // reserve the corner for the -> button
+        + "+'#eq-collapse-btn{position:fixed;top:0;right:0;height:28px;min-width:40px;z-index:2147483647;display:flex;align-items:center;justify-content:center;background:#141414;color:#fff;font-size:16px;cursor:pointer;user-select:none;border-bottom:1px solid #353535}'"
+        + "+'#eq-expand-btn{position:fixed;top:0;right:0;height:28px;min-width:40px;z-index:2147483647;display:none;align-items:center;justify-content:center;background:#000;color:#fff;font-size:16px;cursor:pointer;user-select:none}'"
+        + "+'body.eq-collapsed .highlite_titlebar{display:none!important}'"
+        + "+'body.eq-collapsed .highlite_bar{display:none!important}'"
+        + "+'body.eq-collapsed .highlite_bar_selected_content{display:none!important}'"
+        + "+'body.eq-collapsed #eq-collapse-btn{display:none!important}'"
+        + "+'body.eq-collapsed #eq-expand-btn{display:flex!important}';"
+        + "var s=document.createElement('style');s.textContent=css;(document.head||document.documentElement).appendChild(s);"
+        + "function setup(){if(!document.body)return;"
+        + "if(!document.getElementById('eq-collapse-btn')){"
+        + "var cb=document.createElement('div');cb.id='eq-collapse-btn';cb.title='Hide bars';cb.textContent='\\u2192';"
+        + "cb.addEventListener('click',function(){document.body.classList.add('eq-collapsed');});document.body.appendChild(cb);}"
+        + "if(!document.getElementById('eq-expand-btn')){"
+        + "var eb=document.createElement('div');eb.id='eq-expand-btn';eb.title='Show bars';eb.textContent='\\u2190';"
+        + "eb.addEventListener('click',function(){document.body.classList.remove('eq-collapsed');});document.body.appendChild(eb);}}"
+        + "if(document.body)setup();else addEventListener('DOMContentLoaded',setup);"
+        + "var iv=setInterval(setup,500);setTimeout(function(){clearInterval(iv);},15000);})();";
+
     private String injectShim(String html) {
-        String tag = "<script>" + ELECTRON_SHIM + "</script>";
+        // MOBILE_UI (auto-hide/swipe) is deferred; MOBILE_TOPBAR (window-control removal + collapse
+        // toggle) is active.
+        String tag = "<script>" + ELECTRON_SHIM + "</script><script>" + MOBILE_TOPBAR + "</script>";
         int i = html.indexOf("<head>");
         if (i >= 0) return html.substring(0, i + 6) + tag + html.substring(i + 6);
         return tag + html;
