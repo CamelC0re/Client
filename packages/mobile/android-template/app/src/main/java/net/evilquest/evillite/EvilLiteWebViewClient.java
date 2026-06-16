@@ -40,17 +40,30 @@ import java.util.regex.Pattern;
 public class EvilLiteWebViewClient extends BridgeWebViewClient {
     private static final Pattern CLASS_RE = Pattern.compile("\\bclass\\s+([A-Za-z0-9_]+)");
 
-    // The renderer is built for Electron and expects window.electron (the @electron-toolkit
-    // preload: ipcRenderer, process, webFrame). There is no preload in a WebView, so we inject
-    // a minimal stub into the served HTML before the renderer's modules run. ipcRenderer is a
-    // no-op (asset-cache load resolves to {} → icons blank until a Capacitor Filesystem backend
-    // lands; see SPIKE.md). This unblocks the bootstrap.
+    // The renderer is built for Electron and expects the @electron-toolkit preload globals
+    // (window.electron / settings / screenshot via exposeInMainWorld). A WebView has no preload,
+    // so we inject this shim into the served HTML before the renderer's modules run. The
+    // ipcRenderer's oauth:* channels are routed to the native EvilLiteNative (OAuthBridge);
+    // everything else is a no-op (asset-cache load resolves to undefined → caches empty until a
+    // Filesystem backend lands; see SPIKE.md).
     private static final String ELECTRON_SHIM =
-        "(function(){var noop=function(){};" +
-        "var ipc={send:noop,sendSync:function(){return null;},postMessage:noop," +
+        "(function(){var noop=function(){};var N=function(){return window.EvilLiteNative;};" +
+        "var cbN=0,cbM={};" +
+        "window.__eqNativeResolve=function(id,res){var f=cbM[id];if(f){delete cbM[id];f(res);}};" +
+        "function nat(m){return new Promise(function(res){var n=N();if(!n||typeof n[m]!=='function'){res(undefined);return;}" +
+        "var id='cb'+(++cbN);cbM[id]=res;try{n[m](id);}catch(e){delete cbM[id];res(undefined);}});}" +
+        "var ipc={postMessage:noop," +
         "on:function(){return ipc;},once:function(){return ipc;},off:function(){return ipc;}," +
-        "addListener:function(){return ipc;},removeListener:function(){return ipc;}," +
-        "removeAllListeners:function(){return ipc;},invoke:function(){return Promise.resolve(undefined);}};" +
+        "addListener:function(){return ipc;},removeListener:function(){return ipc;},removeAllListeners:function(){return ipc;}," +
+        "invoke:function(ch){" +
+        "if(ch==='oauth:login')return nat('login');" +
+        "if(ch==='oauth:auto-login')return nat('autoLogin');" +
+        "if(ch==='oauth:ensure-fresh')return nat('ensureFresh');" +
+        "if(ch==='oauth:logout')return nat('logout');" +
+        "if(ch==='oauth:status')return nat('status');" +
+        "return Promise.resolve(undefined);}," +
+        "send:function(ch){var n=N();if(!n)return;try{if(ch==='oauth:heartbeat')n.heartbeat();else if(ch==='oauth:logged-out')n.loggedOut();}catch(e){}}," +
+        "sendSync:function(ch){var n=N();if(n&&ch==='oauth:logged-out'){try{return n.loggedOut();}catch(e){}}return null;}};" +
         "if(!window.electron){window.electron={ipcRenderer:ipc," +
         "process:{platform:'android',env:{},versions:{},argv:[]}," +
         "webFrame:{setZoomFactor:noop,setZoomLevel:noop,getZoomLevel:function(){return 0;},getZoomFactor:function(){return 1;}}};}" +
