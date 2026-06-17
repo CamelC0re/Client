@@ -17,7 +17,11 @@ const SKIP_DIR = new Set(['node_modules', 'dist', 'out', 'build', '.git']);
 const RULES = [
   { re: /\bsendInputActivity\b/, msg: "calls the game's input-activity fn (mints an anti-bot ticket without a real user event)" },
   { re: /\b(consumePendingInputTicket|pendingInputTicketSeq|sendInputTicket|inputTicketBurst)\b/, msg: 'touches EvilQuest input-ticket internals (ticket forgery)' },
-  { re: /new\s+(KeyboardEvent|MouseEvent|PointerEvent|TouchEvent)\b/, msg: 'constructs a synthetic input event (fabricated game input; isTrusted=false but still a botting pattern)' },
+  { re: /new\s+(KeyboardEvent|PointerEvent|TouchEvent)\b/, msg: 'constructs a synthetic input event (fabricated game input; isTrusted=false but still a botting pattern)' },
+  // Synthetic MouseEvent, EXCEPT "contextmenu" — a right-click context menu is plugin UI, not a
+  // gameplay input (and isTrusted=false can't drive the game anyway). e.g. the World Map's mobile
+  // long-press opens its own "Share location" menu via a synthetic contextmenu.
+  { re: /new\s+MouseEvent\s*\(\s*["'](?!contextmenu\b)/, msg: 'constructs a synthetic mouse input event (fabricated game input)' },
   { re: /\b(robotjs|nut-js|@nut-tree)\b/, msg: 'OS-level input automation library (auto-clicker / bot)' },
 ];
 
