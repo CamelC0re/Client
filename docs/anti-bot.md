@@ -76,9 +76,30 @@ never weaken EvilQuest's defenses.** A fork that adds botting is on the botter �
 by the server-side ticket system. We compete on *not being the easy on-ramp*, and we cooperate with
 the EvilQuest developers rather than working around them (consistency, not spoofing).
 
+## Mobile (Android / Capacitor)
+
+The Android client is a native WebView (Chromium) in a Capacitor shell — same trusted-input concern.
+`WebView.setWebContentsDebuggingEnabled(true)` (or a `debuggable` APK) makes the WebView inspectable
+via `chrome://inspect` over adb, and CDP there injects `isTrusted:true` input that bypasses the ticket
+system — the mobile equivalent of the desktop remote-debugging port.
+
+So distribution splits the same way as the desktop updater (fork = test, canonical = shipped):
+- **Fork builds (`atapifire/EvilLite`)** → **debug APK** (debuggable, WebView inspectable) — for our
+  own testing. `v*` tags on the fork still produce installable debug APKs.
+- **Canonical builds (`CamelC0re/Client`)** → **signed release APK** (`debuggable=false`) — WebView
+  debugging stays off. The CI build **fails** if the signing secrets are missing rather than shipping
+  a debuggable APK (`build.yml`, keyed on `github.repository`).
+- `MainActivity` calls `setWebContentsDebuggingEnabled(FLAG_DEBUGGABLE)` — explicit and auditable, so
+  a non-debuggable release keeps it off regardless of Capacitor defaults.
+- Release signing + the CI secrets it needs: **`docs/release-signing.md`**.
+
 ## Enforcement in this repo
-- `scripts/guard-input-fabrication.mjs` — scans `packages/client/src` + `packages/core/src` (run in
-  CI after the plugin sync, so bundled plugins are covered). Fails the build on any vector above.
+- `scripts/guard-input-fabrication.mjs` — scans `packages/client/src` + `packages/core/src` +
+  `packages/mobile` (incl. the Android shell `.java`), run in CI after the plugin sync so bundled
+  plugins are covered. Fails the build on any vector above, and on a literal
+  `setWebContentsDebuggingEnabled(true)`.
 - `main/index.ts` — `remote-debugging-port` hard-gated to `!app.isPackaged`.
 - `main/devLogin.ts` — the dev browser-login (CDP session relay) is not even registered in packaged
   builds.
+- `MainActivity.java` — WebView debugging gated to `FLAG_DEBUGGABLE`; canonical CI ships a signed,
+  non-debuggable release APK.
