@@ -1,0 +1,20 @@
+{
+  "name": "@evillite/mobile",
+  "version": "0.0.0",
+  "private": true,
+  "description": "EvilLite mobile shell (Capacitor) — Android spike. Wraps the same renderer the desktop client uses.",
+  "scripts": {
+    "build:web": "node scripts/build-web.mjs",
+    "cap:add:android": "cap add android",
+    "cap:sync": "cap sync android",
+    "cap:open": "cap open android",
+    "apk:debug": "cd android && ./gradlew assembleDebug"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.1.0",
+    "@capacitor/core": "^6.1.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.1.0"
+  }
+}
