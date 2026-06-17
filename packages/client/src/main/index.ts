@@ -30,7 +30,14 @@ log.transports.file.level = 'debug';
 app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
 
 // Dev-only: expose CDP so we can inspect/drive the renderer (EQ_DEBUG=1).
-if (process.env.EQ_DEBUG === '1') {
+//
+// SECURITY: this is HARD-gated to unpackaged (dev) builds and can never be enabled in a
+// release. Remote debugging is an anti-bot bypass: CDP's Input.dispatchMouseEvent /
+// dispatchKeyEvent inject events with isTrusted=true, which mint EvilQuest's input ticket
+// — letting an attacker drive the game programmatically straight past the server-side
+// anti-bot check. A release build must never open this port, regardless of env. See
+// docs/anti-bot.md.
+if (!app.isPackaged && process.env.EQ_DEBUG === '1') {
     app.commandLine.appendSwitch('remote-debugging-port', '9222');
     app.commandLine.appendSwitch('remote-allow-origins', 'http://localhost:9222');
 }
