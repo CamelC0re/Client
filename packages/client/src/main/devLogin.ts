@@ -330,6 +330,10 @@ async function runDevLogin(): Promise<DevLoginResult> {
 }
 
 export function registerDevLogin() {
+    // Defense-in-depth: in a packaged (release) build, don't even register the IPC handler.
+    // runDevLogin() also refuses when packaged, but this keeps the channel from existing at all.
+    // The dev-login spawns Chrome with remote-debugging to relay a session — strictly a dev tool.
+    if (app.isPackaged) return;
     ipcMain.handle('dev-login:start', async (): Promise<DevLoginResult> => {
         try { return await runDevLogin(); }
         catch (e) { return { ok: false, error: String(e) }; }
