@@ -71,6 +71,11 @@ jobs:
         run: yarn workspace @evillite/core build
 
       - name: Build client (renderer + main + copy plugin cache)
+        # __EVILLITE_CANONICAL__ is baked here: TRUE only when this build runs in the canonical
+        # CamelC0re/Client repo, so fork builds (e.g. atapifire/EvilLite betas testers grab) never
+        # auto-update, while canonical builds update from CamelC0re/Client. See updater/index.ts.
+        env:
+          EVILLITE_CANONICAL: ${{ github.repository == 'CamelC0re/Client' }}
         run: yarn workspace @evillite/client build
 
       - name: Package (${{ matrix.platform }})
