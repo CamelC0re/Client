@@ -61,6 +61,12 @@ jobs:
           git clone --depth 1 https://github.com/atapifire/evillite-collectionlog.git /tmp/cl || exit 0
           cp /tmp/cl/src/CollectionLogPlugin.ts packages/client/src/renderer/client/plugins/CollectionLogPlugin.ts 2>/dev/null || true
 
+      # Anti-bot guard: fail the build if the client/core OR any bundled plugin contains an
+      # input-fabrication / trusted-input bypass. Runs AFTER the plugin sync so it scans the
+      # bundled plugins too. We never ship a way to bot EvilQuest. See docs/anti-bot.md.
+      - name: Anti-bot guard (no input fabrication)
+        run: node scripts/guard-input-fabrication.mjs
+
       - name: Build core
         run: yarn workspace @evillite/core build
 
