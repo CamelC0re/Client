@@ -52,8 +52,8 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "Metsutan",
-        "repo": "EvilLite"
+        "owner": "CamelC0re",
+        "repo": "Client"
       }
     ],
     "mac": {
