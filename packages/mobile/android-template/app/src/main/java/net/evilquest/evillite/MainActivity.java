@@ -1,5 +1,6 @@
 package net.evilquest.evillite;
 
+import android.content.pm.ApplicationInfo;
 import android.os.Bundle;
 import android.webkit.CookieManager;
 import android.webkit.WebView;
@@ -22,6 +23,14 @@ public class MainActivity extends BridgeActivity {
         super.onCreate(savedInstanceState);
 
         WebView webView = this.bridge.getWebView();
+
+        // ANTI-BOT: WebView remote debugging (chrome://inspect over adb) injects events with
+        // isTrusted=true, which mint EvilQuest's input ticket — driving the game past the server-side
+        // anti-bot. Enable it ONLY in a debuggable (dev/test) build; the shipped signed release APK is
+        // debuggable=false, so it stays off. Explicit + auditable (the CI guard checks for this). The
+        // desktop equivalent is the !app.isPackaged gate on remote-debugging-port. See docs/anti-bot.md.
+        boolean debuggable = (getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+        WebView.setWebContentsDebuggingEnabled(debuggable);
 
         CookieManager cm = CookieManager.getInstance();
         cm.setAcceptCookie(true);

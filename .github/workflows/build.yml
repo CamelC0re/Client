@@ -135,6 +135,8 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/atapifire/evillite-collectionlog.git /tmp/cl || exit 0
           cp /tmp/cl/src/CollectionLogPlugin.ts packages/client/src/renderer/client/plugins/CollectionLogPlugin.ts 2>/dev/null || true
+      - name: Anti-bot guard (no input fabrication)
+        run: node scripts/guard-input-fabrication.mjs
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -145,8 +147,20 @@ jobs:
         run: |
           yarn workspace @evillite/core build
           yarn workspace @evillite/client build
-      - name: Build debug APK
+      # Fork builds (atapifire/EvilLite) -> DEBUG apk: debuggable, WebView inspectable over adb, for
+      # our own testing. Canonical (CamelC0re/Client) -> SIGNED RELEASE apk: debuggable=false, so the
+      # WebView can't be driven over chrome://inspect (CDP injects isTrusted input that would bypass
+      # EvilQuest's anti-bot). Same canonical/fork split as the desktop updater gate. A canonical
+      # build with no signing secrets FAILS rather than silently shipping a debuggable apk.
+      # See docs/anti-bot.md + docs/release-signing.md.
+      - name: Build APK (debug on fork, signed release on canonical)
         working-directory: packages/mobile
+        env:
+          IS_CANONICAL: ${{ github.repository == 'CamelC0re/Client' }}
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           node scripts/build-web.mjs
           npx cap add android
@@ -154,9 +168,24 @@ jobs:
              android/app/src/main/java/net/evilquest/evillite/
           echo "sdk.dir=$ANDROID_HOME" > android/local.properties
           npx cap sync android
-          (cd android && ./gradlew assembleDebug --no-daemon)
           mkdir -p out-apk
-          cp android/app/build/outputs/apk/debug/app-debug.apk out-apk/EvilLite-android-debug.apk
+          if [ "$IS_CANONICAL" = "true" ]; then
+            if [ -z "$ANDROID_KEYSTORE_B64" ]; then
+              echo "::error::Canonical release APK requires signing secrets (ANDROID_KEYSTORE_B64 etc). See docs/release-signing.md. Refusing to ship a debuggable APK."
+              exit 1
+            fi
+            echo "$ANDROID_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            # AGP injected signing — no need to edit the Capacitor-generated build.gradle.
+            (cd android && ./gradlew assembleRelease --no-daemon \
+              -Pandroid.injected.signing.store.file="$RUNNER_TEMP/release.keystore" \
+              -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
+              -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS" \
+              -Pandroid.injected.signing.key.password="$ANDROID_KEY_PASSWORD")
+            cp android/app/build/outputs/apk/release/app-release.apk out-apk/EvilLite-android.apk
+          else
+            (cd android && ./gradlew assembleDebug --no-daemon)
+            cp android/app/build/outputs/apk/debug/app-debug.apk out-apk/EvilLite-android-debug.apk
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
