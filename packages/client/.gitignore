@@ -5,8 +5,15 @@
 
 package-lock.json
 
-# Don't keep plugins in the repository
-src/renderer/client/plugins/
+# Don't keep plugins in the repository (they're synced from their own repos)…
+src/renderer/client/plugins/*
+!src/renderer/client/plugins/data/
+src/renderer/client/plugins/data/*
+# …except the World Map's prebaked asset caches, which MUST ship inside the build so the map loads
+# a full set of model icons + terrain on first launch (the model GLBs can't all be re-rendered
+# client-side — some 404 server-side — so these are the source of truth). See copy-plugin-data.mjs.
+!src/renderer/client/plugins/data/model-icons.json
+!src/renderer/client/plugins/data/world-map-terrain.json
 
 # We use Yarn at production, so we don't want to keep package-lock.json from developers
 .package-lock.json
