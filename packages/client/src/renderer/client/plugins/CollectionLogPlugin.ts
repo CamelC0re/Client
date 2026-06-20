@@ -114,6 +114,7 @@ export default class CollectionLogPlugin extends Plugin {
         if (!this.data.log || typeof this.data.log !== 'object') this.data.log = {};
         if (!this.data.meta || typeof this.data.meta !== 'object') this.data.meta = {};       // source -> SourceMeta
         if (!this.data.collapsed || typeof this.data.collapsed !== 'object') this.data.collapsed = {}; // groupKey -> bool
+        if (!this.data.itemIcons || typeof this.data.itemIcons !== 'object') this.data.itemIcons = {}; // itemId -> data-URL, harvested for items with no 2D icon
     }
 
     // ── detection engine ──────────────────────────────────────────────────────
@@ -203,8 +204,18 @@ export default class CollectionLogPlugin extends Plugin {
             if (!id) return;
             const q = parseInt(el.dataset.itemQuantity || '1', 10) || 1;
             m.set(id, (m.get(id) || 0) + q);
+            this.harvestItemIcon(id, el);
         });
         return m;
+    }
+
+    /** Items with no 2D `.icon` are drawn by the game from their 3D model into a data-URL in the
+     *  inventory DOM. Cache it the first time we see the item so the log can show the same icon
+     *  later, even once the item has left the bag. (Items that ship a 2D icon don't need this.) */
+    private harvestItemIcon(id: number, slot: HTMLElement): void {
+        if (!id || this.itemDef(id)?.icon || this.data.itemIcons?.[id]) return;
+        const src = slot.querySelector('img')?.getAttribute('src') || '';
+        if (src.startsWith('data:image')) { (this.data.itemIcons ||= {})[id] = src; }
     }
 
     /** Resolve a worldObject instance id → def name + category + defId + model assetId.
@@ -245,9 +256,14 @@ export default class CollectionLogPlugin extends Plugin {
     }
     private itemDef(itemId: number): any { return this.em?.itemDefsCache?.get(itemId) ?? null; }
     private itemName(itemId: number): string { return (this.itemDef(itemId)?.name ?? `Item #${itemId}`) + ''; }
-    /** 2D icon if the item ships one, else the pre-rendered 3D icon (every item has one). */
-    private itemIcon(itemId: number): string { const ic = this.itemDef(itemId)?.icon; return ic ? ICON_BASE + ic : this.itemIcon3d(itemId); }
-    private itemIcon3d(itemId: number): string { return `${ICON_BASE}3d/${itemId}.png`; }
+    /** The item's icon, matching what the inventory shows: its 2D icon if it ships one, otherwise
+     *  the data-URL the game rendered from the item's 3D model (harvested from the live inventory —
+     *  there is no static URL for those; `items/3d/<id>.png` 404s). '' if we've never seen it. */
+    private itemIcon(itemId: number): string {
+        const ic = this.itemDef(itemId)?.icon;
+        if (ic) return ICON_BASE + encodeURIComponent(ic);
+        return this.data.itemIcons?.[itemId] || '';
+    }
 
     // ── source identity / icons ───────────────────────────────────────────────
     /** Stored meta for a source, backfilling type/defId by name for pre-existing log entries. */
@@ -276,8 +292,19 @@ export default class CollectionLogPlugin extends Plugin {
     private sourceIcon(src: string): string | null {
         const m = this.sourceMeta(src);
         if (m.type === 'npc' && m.defId != null) return ModelIconCache.resolveNpc(this.modelIcons, m.defId);
+        // A fishing spot's own model is just water/bubbles; show its tool (net/rod) icon instead —
+        // that's the icon the player recognises from their inventory.
+        if (m.type === 'fishingspot') { const tool = this.toolItemIcon(m.defId); if (tool) return tool; }
         if (m.type === 'chest' || m.type === 'stall' || m.type === 'tree' || m.type === 'rock' || m.type === 'fishingspot') return ModelIconCache.resolveObject(this.modelIcons, m.assetId, m.defId);
         return null;
+    }
+
+    /** A gathering spot's tool item icon (e.g. a fishing spot's `visualToolItemId` → Fishing Net). */
+    private toolItemIcon(defId?: number): string | null {
+        if (defId == null) return null;
+        const tid = this.gm?.objectDefsCache?.get(defId)?.visualToolItemId;
+        const ic = tid != null ? this.itemDef(tid)?.icon : null;
+        return ic ? ICON_BASE + encodeURIComponent(ic) : null;
     }
 
     // ── UI (bank-style) ───────────────────────────────────────────────────────
@@ -427,9 +454,11 @@ export default class CollectionLogPlugin extends Plugin {
             const slot = document.createElement('div');
             slot.title = `${this.itemName(itemId)} ×${count}`;
             Object.assign(slot.style, { position: 'relative', width: '48px', height: '48px', background: '#2a2219', border: '1px solid #1a1612', borderRadius: '3px' } as CSSStyleDeclaration);
-            const url = this.itemIcon(itemId), fb = this.itemIcon3d(itemId);
-            slot.innerHTML = `<img src="${url}" style="width:100%;height:100%;object-fit:contain" onerror="if(this.dataset.fb){this.style.display='none'}else{this.dataset.fb=1;this.src='${fb}'}">` +
-                `<span style="position:absolute;right:1px;bottom:0;font-size:11px;color:#fff;text-shadow:0 0 3px #000,1px 1px 2px #000">${count > 999 ? Math.floor(count / 1000) + 'k' : count}</span>`;
+            const url = this.itemIcon(itemId);
+            const countSpan = `<span style="position:absolute;right:1px;bottom:0;font-size:11px;color:#fff;text-shadow:0 0 3px #000,1px 1px 2px #000">${count > 999 ? Math.floor(count / 1000) + 'k' : count}</span>`;
+            slot.innerHTML = (url
+                ? `<img src="${url}" style="width:100%;height:100%;object-fit:contain" onerror="this.style.display='none'">`
+                : `<span style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:22px;opacity:.45">📦</span>`) + countSpan;
             grid.appendChild(slot);
         }
         let displayName = this.selectedSource;
