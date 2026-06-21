@@ -263,11 +263,19 @@ async function obtainGameClient() {
     const settleTimer = setInterval(() => {
         const modules = (window as any).__eqSourceModules;
         const count = Array.isArray(modules) ? modules.length : 0;
+        // Readiness signal: the GameManager bundle is present in the captured source.
+        // We used to gate on window.gm, but EvilQuest's bundle update STOPPED assigning
+        // window.gm (it's no longer a global), so that gate never opened -> the Reflector
+        // never parsed -> zero hooks -> dead client. GameManager's source still ships its
+        // distinctive method, so detect that instead (window.gm-independent). Keep the
+        // window.gm OR as a fast-path in case it ever comes back.
+        const gmReady = (window as any).gm
+            || (Array.isArray(modules) && modules.some((m: string) => typeof m === 'string' && m.includes('waitForCurrentLocalPlayerReady')));
         if (count === lastCount && count > 0) {
             stableTicks++;
-            if (stableTicks >= 3 && !(window as any).__eqHooksBound && (window as any).gm && count > lastParsedCount) {
+            if (stableTicks >= 3 && !(window as any).__eqHooksBound && gmReady && count > lastParsedCount) {
                 lastParsedCount = count;
-                console.log('[EvilLite] Parsing at', count, 'modules (game core ready)...');
+                console.log('[EvilLite] Parsing at', count, 'modules (GameManager source present)...');
                 runReflectorParse();
             }
         } else {
