@@ -100,6 +100,12 @@ export default class WorldMapPlugin extends Plugin {
     private worldW = 0;
     private worldH = 0;
     private worldWalls = new Uint8Array(0);
+    // Per-tile terrain colour, 0=unpainted else (0xFF<<24)|(r<<16)|(g<<8)|b. The SOURCE OF TRUTH for
+    // terrain: it only ever accumulates real rendered tiles (like worldWalls), is what we persist,
+    // and never erodes. The canvas + API fill are just a render of it. Avoids the old raster-snapshot
+    // erosion (a flat frame, the seed/API race, or the downgrade guard degrading the saved map).
+    private worldTerrain = new Uint32Array(0);
+    private terrainSeeded = false; // true once worldTerrain has been restored from cache (or there's none) — gates persist so a partial pre-seed map can't overwrite a full saved one
     // Invalidates in-flight async terrain seeds when the canvas is recreated (floor/size change).
     private worldSeedToken = 0;
     // Throttle for re-baking the shipped terrain cache in dev (ms timestamp).
@@ -412,6 +418,24 @@ export default class WorldMapPlugin extends Plugin {
         return null;
     }
 
+    private lastPlayerAngle: number | null = null;
+    /** The player's facing angle for our NORTH-UP world map. We piggyback the vanilla minimap's
+     *  already-smoothed arrow angle (mm.playerArrowAngle — it runs the game's smoothPlayerArrowAngle
+     *  rate-limiter and tracks the heading exactly) and convert it from the minimap's CAMERA-ROTATED
+     *  frame into our north-up frame by adding (alpha − π/2). Verified empirically: across all stable
+     *  samples our north-up angle == mm.playerArrowAngle + mm.lastAlpha − π/2. This makes our arrow
+     *  glide and face identically to the in-game minimap arrow, and the (+alpha) term cancels camera
+     *  rotation so it stays north-up. (The old approach derived atan2(headingDx,−headingDz) behind a
+     *  0.0009 speed threshold that rejected straight N/S/E/W movement → stale/wrong-facing arrow.)
+     *  null until the game has computed an arrow angle (first move). */
+    private getPlayerAngle(): number | null {
+        const mm = this.gm?.minimap;
+        if (!mm || !mm.hasPlayerArrowAngle) return this.lastPlayerAngle;
+        const a = mm.playerArrowAngle + (mm.lastAlpha || 0) - Math.PI / 2;
+        this.lastPlayerAngle = Math.atan2(Math.sin(a), Math.cos(a)); // normalise to (−π, π]
+        return this.lastPlayerAngle;
+    }
+
     // ── Category styling (defaults + dynamic fallback for new categories) ──────────
     private static readonly CAT_COLOR: Record<string, string> = {
         tree: '#3ea63e',
@@ -472,9 +496,15 @@ export default class WorldMapPlugin extends Plugin {
         const cm = this.getChunkManager();
         const live = !!(cm && (cm.mapWidth | 0) && ((cm.tilePaintedEntries?.size | 0) > 0)) && !!this.getPlayerPos();
         if (live && !this.wasOnline) {
-            this.worldCanvas = null;     // force a clean rebuild (+ re-seed from caches)
+            // Reconnect (e.g. after the 5-min AFK kick). Do NOT wipe the worldCanvas — the live paint
+            // (drawImage source-over) and the seed (destination-over) are additive, so the accumulated
+            // terrain isn't stale, just possibly missing tiles that loaded mid-teardown. Wiping it was
+            // the cause of terrain "clearing" on every transient offline→online blip (objects persist
+            // in plugin.data; terrain did not — issue #20). Reset the rebuild throttle so the next pass
+            // repaints the loaded region, and re-seed to backfill any gaps from the saved caches.
             this.lastPaintedSize = -1;
             this.lastRebuild = 0;
+            if (this.worldCanvas) void this.seedWorldFromCaches(this.worldW, this.worldH, this.currentFloor);
         }
         this.wasOnline = live;
     }
@@ -977,9 +1007,11 @@ export default class WorldMapPlugin extends Plugin {
 
     // ── Terrain rendering ─────────────────────────────────────────────────────────
     private static readonly T = { GRASS: 0, DIRT: 1, STONE: 2, WATER: 3, WALL: 4, SAND: 5, WOOD: 6, MUD: 7 };
-    // Base tile-type colors — match game's `ga` table exactly.
+    // Base tile-type colors. Values recovered exactly from the live minimap's tileColorBuf
+    // (base = rendered colour minus the deterministic coordinate noise): GRASS/WATER/DIRT/MUD
+    // verified against the running game; the rest keep the prior `ga`-table approximations.
     private static readonly TYPE_COLOR: Record<number, number[]> = {
-        0: [62, 140, 46], 1: [138, 104, 60], 2: [130, 124, 114], 3: [44, 88, 142],
+        0: [41, 137, 22], 1: [142, 98, 44], 2: [130, 124, 114], 3: [43, 88, 141],
         4: [62, 140, 46], 5: [196, 170, 106], 6: [116, 82, 48], 7: [62, 140, 46],
     };
     private static readonly TEXTURED_COLOR = [138, 116, 82]; // Nf
@@ -1073,7 +1105,7 @@ export default class WorldMapPlugin extends Plugin {
         if (token !== this.worldSeedToken) return;
         const ls = this.loadOfflineBundle();
         if (matches(ls)) layers.push(ls);
-        if (!layers.length) { this.applyApiTerrain(); return; }
+        if (!layers.length) { this.terrainSeeded = true; this.applyApiTerrain(); return; }
 
         const tmp = document.createElement('canvas');
         tmp.width = mapW; tmp.height = mapH;
@@ -1100,8 +1132,12 @@ export default class WorldMapPlugin extends Plugin {
             ctx.globalCompositeOperation = 'destination-over';
             ctx.drawImage(tmp, 0, 0);
             ctx.restore();
+            // Restore the per-tile store from the composited cache so it keeps accumulating from the
+            // full saved map — and what we persist next is the full map, not just this session.
+            try { this.restoreWorldTerrain(tctx.getImageData(0, 0, mapW, mapH).data); } catch { /* ignore */ }
             this.terrainDirty = true;
         }
+        this.terrainSeeded = true;
         this.applyApiTerrain();   // fill any tiles the cache seed didn't cover with the server terrain
     }
 
@@ -1117,6 +1153,8 @@ export default class WorldMapPlugin extends Plugin {
             this.worldW = mapW;
             this.worldH = mapH;
             this.worldWalls = new Uint8Array(mapW * mapH);
+            this.worldTerrain = new Uint32Array(mapW * mapH);
+            this.terrainSeeded = false;
             this.worldCtx = this.worldCanvas.getContext('2d', { willReadFrequently: true });
             this.lastPaintedSize = -1;
             // Seed the blank canvas with previously-explored terrain (shipped prebake +
@@ -1124,6 +1162,16 @@ export default class WorldMapPlugin extends Plugin {
             // patch after a reload/login. Fire-and-forget; drawn behind the live region.
             void this.seedWorldFromCaches(mapW, mapH, this.currentFloor);
         }
+
+        // Live-in-world guard. During an AFK logout / teardown the chunkManager object lingers
+        // (mapWidth still set, getTilesForMinimap still callable) but returns degraded/empty tile
+        // data. Painting that would bake flat tiles over the accumulated worldTerrain AND persist
+        // them to the cache — breaking the whole map, and every subsequent login (the "far side
+        // flat on relog" + "AFK-logout with map open breaks all terrain" reports). Only repaint when
+        // the game is genuinely live: the minimap has painted tiles and we have a player position.
+        // When not live we keep the last good canvas frozen (no worldTerrain writes, no persist).
+        const liveNow = ((cm.tilePaintedEntries?.size | 0) > 0) && !!this.getPlayerPos();
+        if (!liveNow) return !!this.worldCanvas;
 
         const painted = cm.tilePaintedEntries?.size ?? 0;
         const now = performance.now();
@@ -1134,12 +1182,17 @@ export default class WorldMapPlugin extends Plugin {
         this.lastPaintedSize = painted;
         this.lastRebuild = now;
 
-        const RADIUS_CAP = 768;
-        const fullRadius = Math.ceil(Math.max(mapW, mapH) / 2) + 2;
-        const radius = Math.min(fullRadius, RADIUS_CAP);
-        let cx: number, cz: number;
-        if (radius >= fullRadius) { cx = mapW / 2; cz = mapH / 2; }
-        else { const p = this.getPlayerPos(); cx = p ? p.x : mapW / 2; cz = p ? p.z : mapH / 2; }
+        // Rebuild ONLY a render-distance window around the PLAYER — exactly like the vanilla minimap
+        // (it queries getTilesForMinimap(player, ve≈23) and paints all of it). Within this window every
+        // tile is fully rendered, so its colour + slope are valid. Querying the whole map instead also
+        // returns loaded-but-not-yet-rendered chunks at the edge of the load radius as FLAT base colour,
+        // which Pass 1 then bakes over good cached terrain — the "flat rectangular chunk blocks" bug.
+        // Everything outside this window is covered by the seeded cache + API fill; as the player walks,
+        // the window sweeps and accumulates fresh detail into worldTerrain/worldWalls (monotonic).
+        const p = this.getPlayerPos();
+        if (!p) return !!this.worldCanvas;
+        const radius = 24;
+        const cx = p.x, cz = p.z;
 
         let buf: any;
         try { buf = this.getTilesForFloor(cm, cx, cz, radius, this.currentFloor); } catch { return this.lastPaintedSize >= 0; }
@@ -1193,7 +1246,11 @@ export default class WorldMapPlugin extends Plugin {
             }
         }
 
-        // ── Pass 1: per-tile base colour (exactly mirrors the game's minimap logic) ──
+        // ── Pass 1: per-tile base colour (faithfully mirrors the game's minimap beginTerrainRebuild
+        // + the slope shade applied in stepTerrainRebuild). We paint every NON-VOID (loaded) tile —
+        // unloaded chunks come back void and are skipped, preserving the seeded cache. We do NOT gate
+        // on tilePaintedEntries: that set only covers texture-plane tiles, so gating on it dropped the
+        // slope/height shading and walls for ordinary terrain ("flat map, missing walls").
         for (let f = 0; f < size; f++) {
             for (let m = 0; m < size; m++) {
                 const b = f * size + m;
@@ -1247,12 +1304,18 @@ export default class WorldMapPlugin extends Plugin {
 
                 const o = b * 4;
                 data[o] = r; data[o + 1] = g; data[o + 2] = bl; data[o + 3] = 255;
+                // Accumulate this rendered tile into the persistent per-tile store (source of truth).
+                this.worldTerrain[worldZ * mapW + worldX] = 0xFF000000 | (r << 16) | (g << 8) | bl;
             }
         }
 
         // ── Pass 2: Cache wall-edge flags for screen-space rendering ─────────────
-        // The game draws thin lines on each wall-flagged edge of non-wall tiles.
-        // Wall direction bits: N=1, S=2, W=4, E=8 (F enum in the game source).
+        // The game draws thin lines on each wall-flagged edge of non-wall tiles (stepTerrainRebuild's
+        // final loop). Wall direction bits: N=1, S=4, W=8, E=2 ((wf&5)===5 = N+S, (wf&10)===10 = E+W).
+        // MONOTONIC: walls are static, so we only ever ADD edge flags for loaded (non-void) tiles and
+        // never clear them. The whole-map query returns void for unloaded chunks, so a tile that
+        // scrolls out of the loaded region keeps its cached walls instead of being wiped — this is the
+        // proper fix for "walls deleting from cache / only showing near the player".
         for (let f = 0; f < size; f++) {
             for (let m = 0; m < size; m++) {
                 const b = f * size + m;
@@ -1261,10 +1324,8 @@ export default class WorldMapPlugin extends Plugin {
                 if (voidTiles[b]) continue;
                 const wf = walls[b];
                 const type = tiles[b];
-                // Only cache edge lines for non-wall tiles that have wall-edge flags.
-                if (!wf || type === T.WALL || (wf & 5) === 5 || (wf & 10) === 10) {
-                    this.worldWalls[worldZ * mapW + worldX] = 0;
-                } else {
+                // Record edge lines only for non-wall tiles that carry partial wall-edge flags.
+                if (wf && type !== T.WALL && (wf & 5) !== 5 && (wf & 10) !== 10) {
                     this.worldWalls[worldZ * mapW + worldX] = wf;
                 }
             }
@@ -1403,17 +1464,24 @@ export default class WorldMapPlugin extends Plugin {
     /** Re-render whatever viewer is open once async API data lands. */
     private afterApiLoad(): void {
         try {
-            this.applyApiTerrain();   // fill the full map base from the server terrain grid
+            // Re-seed rather than applying the API directly: seedWorldFromCaches draws the offline
+            // DETAIL first and the API flat fill only AFTER it, so the API can never pre-empt the
+            // async offline draw and end up on top of your cached terrain (the login "terrain wrong"
+            // race — logout looked fine because it replays the bundle directly with no race).
+            if (this.worldCanvas) void this.seedWorldFromCaches(this.worldW, this.worldH, this.currentFloor);
             const s = this.buildMapSnapshot();
             if (s) this.pushToViewer({ full: s, p: s.p });
         } catch { /* not in-world yet */ }
     }
 
-    // Server tileRows char -> colour. Matches the game's base tile palette (see TYPE_COLOR);
-    // p=path uses the textured colour, m=mud a muted swamp green.
+    // Server tileRows char -> colour. Matches the new gm base palette (TYPE_COLOR, recovered exactly
+    // from the live minimap buffer) so the API-fill regions blend seamlessly into walked/gm-rendered
+    // terrain instead of showing a lighter-green colour seam. p=path uses the textured colour,
+    // m=mud a muted swamp green. (API fill has no height data, so it can't carry slope shading — those
+    // regions gain the bump/shadow detail once the player walks them and the gm paints over.)
     private static readonly TILE_CHAR_COLOR: Record<string, number[]> = {
-        g: [62, 140, 46], d: [138, 104, 60], p: [138, 116, 82], s: [196, 170, 106],
-        r: [130, 124, 114], w: [44, 88, 142], m: [78, 110, 52],
+        g: [41, 137, 22], d: [142, 98, 44], p: [138, 116, 82], s: [196, 170, 106],
+        r: [130, 124, 114], w: [43, 88, 141], m: [78, 110, 52],
     };
 
     /** Paint the authoritative full-map terrain (API `tileRows`) into the worldCanvas, filling every
@@ -1542,7 +1610,7 @@ export default class WorldMapPlugin extends Plugin {
         const player = this.getPlayerPos();
         const data = {
             id: this.mapId || 'world', W, H, t: terrain, ic: icons, ob: objects, ct: cats, pi: pois, mm: mmIcons,
-            floor: this.currentFloor, p: player ? { x: player.x, z: player.z } : null,
+            floor: this.currentFloor, p: player ? { x: player.x, z: player.z, a: this.getPlayerAngle() } : null,
             npc, ns, pl, wl, online: !!player, dest: this.getMoveDest(),
         };
         this.saveOfflineBundle(data); // so the map still works after logout
@@ -1587,6 +1655,49 @@ export default class WorldMapPlugin extends Plugin {
     private terrainScore(b: any): number {
         if (!b) return 0;
         return (typeof b.t === 'string' ? b.t.length : 0) + (Array.isArray(b.wl) ? b.wl.length * 8 : 0);
+    }
+
+    /** Persist the terrain (+ walls) to the offline bundle whenever the canvas changes — so walking
+     *  to fill in terrain detail is cached like objects/walls. (saveOfflineBundle, the full-snapshot
+     *  path, only fires when a MARKER changes; terrain alone never triggered it, so explored terrain
+     *  was lost on reload/logout — issue: terrain not cached like other assets.) Keeps the previously
+     *  saved objects/icons/markers and is downgrade-guarded so a mid-teardown blank can't clobber it. */
+    private persistTerrainToBundle(): void {
+        // worldTerrain is the monotonic source of truth; only persist once it's been restored from
+        // cache (terrainSeeded) so a partial pre-seed map can't overwrite a full saved one.
+        if (!this.terrainSeeded || !this.worldW || !this.worldH) return;
+        const id = this.mapId || 'world', floor = this.currentFloor, W = this.worldW, H = this.worldH;
+        const t = this.encodeWorldTerrain();
+        if (!t) return;
+        const wl: number[] = []; const ww = this.worldWalls;
+        if (ww) for (let z = 0; z < H; z++) for (let x = 0; x < W; x++) { const k = z * W + x; if (ww[k]) wl.push(x, z, ww[k]); }
+        const prev = this.loadOfflineBundle();
+        const b: any = (prev && prev.id === id && prev.floor === floor) ? { ...prev } : { id, floor };
+        b.id = id; b.floor = floor; b.W = W; b.H = H; b.t = t; b.wl = wl;
+        // No downgrade guard: worldTerrain only ever accumulates, so the saved map can't lose detail.
+        try { localStorage.setItem('eq_wm_offline', JSON.stringify(b)); } catch { /* quota */ }
+        const now = Date.now();
+        if (now - this.lastTerrainBake > 30000) { this.lastTerrainBake = now; try { this.terrainCacheStore.save(`${id}:${floor}`, JSON.stringify(b)); } catch { /* ignore */ } }
+    }
+
+    /** Encode the per-tile terrain store to a PNG (unpainted tiles transparent) — the persisted
+     *  terrain: real explored tiles only, no API fill, monotonic so it can never lose detail. */
+    private encodeWorldTerrain(): string {
+        const W = this.worldW, H = this.worldH, wt = this.worldTerrain;
+        if (!W || !H || wt.length !== W * H) return '';
+        const c = document.createElement('canvas'); c.width = W; c.height = H;
+        const ctx = c.getContext('2d'); if (!ctx) return '';
+        const img = ctx.createImageData(W, H); const d = img.data;
+        for (let k = 0; k < wt.length; k++) { const v = wt[k]; if (!v) continue; const o = k * 4; d[o] = (v >> 16) & 255; d[o + 1] = (v >> 8) & 255; d[o + 2] = v & 255; d[o + 3] = 255; }
+        ctx.putImageData(img, 0, 0);
+        try { return c.toDataURL('image/png'); } catch { return ''; }
+    }
+
+    /** Restore the per-tile terrain store from previously-saved image pixels — accumulates (only
+     *  sets opaque pixels, never clears an existing tile). */
+    private restoreWorldTerrain(d: Uint8ClampedArray): void {
+        const wt = this.worldTerrain;
+        for (let k = 0; k < wt.length; k++) { const o = k * 4; if (d[o + 3] < 10) continue; wt[k] = 0xFF000000 | (d[o] << 16) | (d[o + 1] << 8) | d[o + 2]; }
     }
 
     /** Pull the shipped terrain prebake (build-committed full map) into memory once, so the
@@ -1906,7 +2017,7 @@ export default class WorldMapPlugin extends Plugin {
                 return { x: n.x, z: n.z, n: this.prettify(n.name), l: n.level ?? 0, i };
             });
             const pl = this.players.map((q) => ({ x: q.x, z: q.z, n: q.name }));
-            this.pushToViewer({ p: p ? { x: p.x, z: p.z } : null, npc, pl, online: !!p, dest: this.getMoveDest() });
+            this.pushToViewer({ p: p ? { x: p.x, z: p.z, a: this.getPlayerAngle() } : null, npc, pl, online: !!p, dest: this.getMoveDest() });
         }, 280);
         // Occasional + heavy: full snapshot — but ONLY when the MARKERS change (a new object/NPC
         // type), NOT on every explored tile. buildMapSnapshot's terrain encode + serialization is a
@@ -1950,7 +2061,7 @@ export default class WorldMapPlugin extends Plugin {
                 this.terrainEncoding = false;
                 if (!blob) return;
                 const fr = new FileReader();
-                fr.onload = () => { this.terrainUrl = fr.result as string; this.pushToViewer({ terrain: this.terrainUrl }); };
+                fr.onload = () => { this.terrainUrl = fr.result as string; this.pushToViewer({ terrain: this.terrainUrl }); this.persistTerrainToBundle(); };
                 fr.onerror = () => {};
                 fr.readAsDataURL(blob);
             }, 'image/png');
@@ -2013,7 +2124,7 @@ export default class WorldMapPlugin extends Plugin {
 + 'var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top,best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}'
 + 'if(best){tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+10)+"px";tip.innerHTML="<b>"+best.n+"</b><br>"+best.s;}else tip.style.display="none";});'
 + 'view.addEventListener("wheel",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var f=e.deltaY<0?1.15:1/1.15;Z=clamp(Z*f,0.3,48);cx=wx+W/(2*Z)-mx/Z;cz=wz+Hh/(2*Z)-my/Z;render();},{passive:false});'
-+ 'view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(typeof sendInput!=="undefined"){sendInput({t:"chat",text:textToCopy});}else if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){var pth=(ev.composedPath&&ev.composedPath())||[];if(!m.contains(ev.target)&&pth.indexOf(m)<0){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});'
++ 'view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(typeof sendInput!=="undefined"){sendInput({t:"chat",text:textToCopy});}else if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};if(D.online){var itm2=document.createElement("div");itm2.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm2.textContent="Walk Here";itm2.onmouseenter=function(){itm2.style.background="#5c5040";};itm2.onmouseleave=function(){itm2.style.background="transparent";};itm2.onclick=function(ev){ev.stopPropagation();m.remove();if(typeof sendInput!=="undefined"){sendInput({t:"move",x:wx,z:wz});}else if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"move",x:wx,z:wz});}};m.appendChild(itm2);}m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){var pth=(ev.composedPath&&ev.composedPath())||[];if(!m.contains(ev.target)&&pth.indexOf(m)<0){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});'
 + 'function goTo(x,z){Z=Math.max(Z,16);cx=x+0.5;cz=z+0.5;render();}'
 + 'function buildTax(){var box=document.getElementById("cats");box.innerHTML="";var esc=function(t){var d=document.createElement("span");d.textContent=t;return d.innerHTML;};'
 + 'var catIcon={},nameIcon={};D.ob.forEach(function(o){if(o.i>=0){if(catIcon[o.c]===undefined)catIcon[o.c]=o.i;if(nameIcon[o.c+"|"+o.n]===undefined)nameIcon[o.c+"|"+o.n]=o.i;}});'
@@ -2154,11 +2265,14 @@ ctx.globalAlpha=1;hits.push({sx:nx,sy:ny,r:nhr,n:N.n+(N.l?" (lv "+N.l+")":"")+(t
 if(npcMode>0){
 if(npcMode===1){var SN=D.ns||[];for(var si=0;si<SN.length;si++)drawNpc(SN[si],0.85,"stored");}
 else{var LV=D.npc||[],SN2=D.ns||[];
-for(var si2=0;si2<SN2.length;si2++){var S=SN2[si2],near=false;for(var li=0;li<LV.length;li++){var ddx=LV[li].x-S.x,ddz=LV[li].z-S.z;if(ddx*ddx+ddz*ddz<=16){near=true;break;}}if(!near)drawNpc(S,0.5,"stored");}
-for(var li2=0;li2<LV.length;li2++)drawNpc(LV[li2],1,"live");}}
+// A live NPC only takes over from its spawn ONCE its model icon is ready — until then we keep the
+// spawn marker (with its cached icon) and skip the live one, so there's no bare yellow dot on login.
+function npcReady(N){var ii=(N.i!==undefined&&N.i>=0)?N.i:(npcIcon[N.n]!==undefined?npcIcon[N.n]:-1);return ii>=0&&!!shadowed(ii);}
+for(var si2=0;si2<SN2.length;si2++){var S=SN2[si2],near=false;for(var li=0;li<LV.length;li++){if(!npcReady(LV[li]))continue;var ddx=LV[li].x-S.x,ddz=LV[li].z-S.z;if(ddx*ddx+ddz*ddz<=16){near=true;break;}}if(!near)drawNpc(S,0.5,"stored");}
+for(var li2=0;li2<LV.length;li2++){if(npcReady(LV[li2]))drawNpc(LV[li2],1,"live");}}}
 if(showPl&&D.pl){for(var pl2=0;pl2<D.pl.length;pl2++){var L=D.pl[pl2];var lx=(L.x-sl)*Z,ly=(L.z-st)*Z;if(lx<-10||lx>W+10||ly<-10||ly>Hh+10)continue;ctx.fillStyle="#2ecc71";ctx.strokeStyle="#fff";ctx.lineWidth=1;ctx.beginPath();ctx.arc(lx,ly,4,0,6.28);ctx.fill();ctx.stroke();hits.push({sx:lx,sy:ly,r:5,n:L.n,s:"Player - "+L.x+","+L.z});}}
 if(D.dest){var dsx=(D.dest.x-sl)*Z,dsy=(D.dest.z-st)*Z;drawDest(ctx,dsx,dsy);}
-if(D.p){var ppx=(D.p.x-sl)*Z,ppy=(D.p.z-st)*Z;ctx.save();ctx.fillStyle="#19b9ff";ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.beginPath();ctx.arc(ppx,ppy,6,0,6.28);ctx.fill();ctx.stroke();ctx.restore();}drawPings();}
+if(D.p){var ppx=(D.p.x-sl)*Z,ppy=(D.p.z-st)*Z;ctx.save();ctx.translate(ppx,ppy);if(D.p.a!=null){ctx.rotate(D.p.a);ctx.fillStyle="#fff";ctx.strokeStyle="#1a1a1a";ctx.lineWidth=1.5;ctx.beginPath();ctx.moveTo(0,-8);ctx.lineTo(5.5,7);ctx.lineTo(0,3.5);ctx.lineTo(-5.5,7);ctx.closePath();ctx.fill();ctx.stroke();}else{ctx.fillStyle="#19b9ff";ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.beginPath();ctx.arc(0,0,6,0,6.28);ctx.fill();ctx.stroke();}ctx.restore();}drawPings();}
 var destT0=0,destRAF=null;
 function drawDest(t,e,i){var s=(performance.now()-destT0)/1000,n=(Math.sin(s*8)+1)*.5,o=Math.max(0,1-s/.55);t.save();t.translate(e,i);t.lineJoin="round";
 if(o>0){t.globalAlpha=.65*o;t.strokeStyle="#fff0b8";t.lineWidth=2;t.beginPath();t.arc(0,0,7+(1-o)*17,0,Math.PI*2);t.stroke();}
@@ -2190,7 +2304,7 @@ var dragging=false,pressed=false,sx0=0,sy0=0,lx0=0,ly0=0,pressT=0,DRAG_THRESH=18
 function clickAt(e){var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
 var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}
 var sl=cx-W/(2*Z),st=cz-Hh/(2*Z);var wx=sl+mx/Z,wz=st+my/Z;
-if(best){var m=best.s.match(/(-?\\d+),(-?\\d+)/);if(m){goTo(parseInt(m[1]),parseInt(m[2]));}}
+if(best){setFollow(false);var ox=sl+best.sx/Z,oz=st+best.sy/Z,hw=W/(2*Z),hh=Hh/(2*Z);cx=D.W>2*hw?Math.max(hw,Math.min(D.W-hw,ox)):D.W/2;cz=D.H>2*hh?Math.max(hh,Math.min(D.H-hh,oz)):D.H/2;render();}
 else if(D.online){sendInput({t:"move",x:wx,z:wz});}}
 view.addEventListener("mousedown",function(e){if(e.button!==0)return;pressed=true;dragging=false;sx0=lx0=e.clientX;sy0=ly0=e.clientY;pressT=Date.now();});
 window.addEventListener("mouseup",function(e){var pth=(e.composedPath&&e.composedPath())||[];var onView=view===e.target||view.contains(e.target)||pth.indexOf(view)>=0;if(pressed&&!dragging&&onView)clickAt(e);pressed=false;dragging=false;view.classList.remove("drag");});
@@ -2198,7 +2312,7 @@ view.addEventListener("mousemove",function(e){if(pressed){if(!dragging){var dist
 var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top,best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}
 if(best){tip.style.display="block";tip.style.left=(mx+14)+"px";tip.style.top=(my+10)+"px";tip.innerHTML="<b>"+best.n+"</b><br>"+best.s;}else tip.style.display="none";});
 view.addEventListener("wheel",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var f=e.deltaY<0?1.15:1/1.15;Z=clamp(Z*f,0.3,48);cx=wx+W/(2*Z)-mx/Z;cz=wz+Hh/(2*Z)-my/Z;render();},{passive:false});
-view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(typeof sendInput!=="undefined"){sendInput({t:"chat",text:textToCopy});}else if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){var pth=(ev.composedPath&&ev.composedPath())||[];if(!m.contains(ev.target)&&pth.indexOf(m)<0){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});
+view.addEventListener("contextmenu",function(e){e.preventDefault();var r=view.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;var wx=cx-W/(2*Z)+mx/Z,wz=cz-Hh/(2*Z)+my/Z;var textToCopy="("+Math.round(wx)+","+Math.round(wz)+")";var best=null,bd=1e9;for(var i=hits.length-1;i>=0;i--){var h=hits[i],d=(h.sx-mx)*(h.sx-mx)+(h.sy-my)*(h.sy-my);if(d<(h.r+4)*(h.r+4)&&d<bd){bd=d;best=h;}}if(best){textToCopy+="["+best.n.replace(/\\s*\\+\\d+$/,"").trim()+"]";}var m=document.getElementById("eq-map-context-menu");if(m)m.remove();m=document.createElement("div");m.id="eq-map-context-menu";m.style.cssText="position:fixed;left:"+e.clientX+"px;top:"+e.clientY+"px;background:#473e32;border:1px solid #1a1612;border-top-color:#72624d;border-left-color:#72624d;z-index:10000;box-shadow:2px 2px 4px rgba(0,0,0,0.5);user-select:none;min-width:120px;font-family:sans-serif;";var hdr=document.createElement("div");hdr.style.cssText="background:#362e24;padding:4px 8px;border-bottom:1px solid #1a1612;color:#ffd24a;font-weight:bold;text-align:center;font-size:12px;cursor:default";hdr.textContent="Select an Option";m.appendChild(hdr);var itm=document.createElement("div");itm.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm.textContent="Share "+textToCopy;itm.onmouseenter=function(){itm.style.background="#5c5040";};itm.onmouseleave=function(){itm.style.background="transparent";};itm.onclick=function(ev){ev.stopPropagation();m.remove();if(typeof sendInput!=="undefined"){sendInput({t:"chat",text:textToCopy});}else if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"chat",text:textToCopy});}};if(D.online){var itm2=document.createElement("div");itm2.style.cssText="padding:6px 10px;cursor:pointer;color:#fff;font-size:13px";itm2.textContent="Walk Here";itm2.onmouseenter=function(){itm2.style.background="#5c5040";};itm2.onmouseleave=function(){itm2.style.background="transparent";};itm2.onclick=function(ev){ev.stopPropagation();m.remove();if(typeof sendInput!=="undefined"){sendInput({t:"move",x:wx,z:wz});}else if(window.electron&&window.electron.ipcRenderer){window.electron.ipcRenderer.send("map-window:input",{t:"move",x:wx,z:wz});}};m.appendChild(itm2);}m.appendChild(itm);document.body.appendChild(m);var closeM=function(ev){var pth=(ev.composedPath&&ev.composedPath())||[];if(!m.contains(ev.target)&&pth.indexOf(m)<0){m.remove();window.removeEventListener("mousedown",closeM);}};setTimeout(function(){window.addEventListener("mousedown",closeM);},0);});
 function setFollow(on){follow=on&&!!D.online;var b=document.getElementById("follow");b.className="btn"+(D.online?"":" dis")+(follow?"":" off");b.innerText=(follow?"◉":"○")+" Follow";if(follow&&D.p){cx=D.p.x+0.5;cz=D.p.z+0.5;render();}}
 document.getElementById("follow").onclick=function(){if(!D.online)return;setFollow(!follow);};
 document.getElementById("fdown").onclick=function(){sendInput({t:"floor",f:(D.floor||0)-1});};
