@@ -257,12 +257,14 @@ export default class CollectionLogPlugin extends Plugin {
     private itemDef(itemId: number): any { return this.em?.itemDefsCache?.get(itemId) ?? null; }
     private itemName(itemId: number): string { return (this.itemDef(itemId)?.name ?? `Item #${itemId}`) + ''; }
     /** The item's icon, matching what the inventory shows: its 2D icon if it ships one, otherwise
-     *  the data-URL the game rendered from the item's 3D model (harvested from the live inventory —
-     *  there is no static URL for those; `items/3d/<id>.png` 404s). '' if we've never seen it. */
+     *  EvilQuest's server-rendered 3D icon at `items/3d/<id>.png`. The game now serves these for
+     *  every item (the inventory renders model-only items from exactly this URL) — they used to
+     *  404, which is why we previously had to harvest the inventory data-URL. A harvested data-URL,
+     *  if we cached one, takes precedence (it's the exact inventory render). '' only if no id. */
     private itemIcon(itemId: number): string {
         const ic = this.itemDef(itemId)?.icon;
         if (ic) return ICON_BASE + encodeURIComponent(ic);
-        return this.data.itemIcons?.[itemId] || '';
+        return this.data.itemIcons?.[itemId] || (itemId ? `${ICON_BASE}3d/${itemId}.png` : '');
     }
 
     // ── source identity / icons ───────────────────────────────────────────────
